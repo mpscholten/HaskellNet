@@ -415,7 +415,9 @@ fetchByString :: IMAPConnection -> UID -> String
               -> IO [(String, String)]
 fetchByString conn uid command =
     do lst <- fetchCommand conn ("UID FETCH "++show uid++" "++command) id
-       return $ snd $ head lst
+       case lst of
+         (x:_) -> return (snd x)
+         _ -> return []
 
 fetchByStringR :: IMAPConnection -> (UID, UID) -> String
                -> IO [(UID, [(String, String)])]
