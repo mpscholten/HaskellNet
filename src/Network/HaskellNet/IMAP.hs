@@ -8,10 +8,10 @@ module Network.HaskellNet.IMAP
       -- ** autenticated state commands
     , select, examine, create, delete, rename
     , subscribe, unsubscribe
-    , list, lsub, status, append, appendFull
+    , list, lsub, status, append, appendFull, appendFullUID
       -- ** selected state commands
     , check, close, expunge
-    , search, store, copy, move
+    , search, store, copy, copyUID, copyUIDs, copyUIDR, uidExpunge, uidExpungeR, move
     , idle
       -- * fetch commands
     , fetch, fetchHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
@@ -19,6 +19,7 @@ module Network.HaskellNet.IMAP
     , fetchPeek, fetchRPeek
       -- * other types
     , Flag(..), Attribute(..), MailboxStatus(..)
+    , AppendUID(..), CopyUID(..), UIDSet
     , SearchQuery(..), FlagsQuery(..)
     , A.AuthType(..)
     )
@@ -175,12 +176,17 @@ show6 n | n > 100000 = show n
 sendCommand :: IMAPConnection -> String
             -> (RespDerivs -> Result RespDerivs (ServerResponse, MboxUpdate, v))
             -> IO v
-sendCommand imapc cmdstr pFunc =
+sendCommand imapc cmdstr pFunc = snd <$> sendCommandWithResponse imapc cmdstr pFunc
+
+sendCommandWithResponse :: IMAPConnection -> String
+                        -> (RespDerivs -> Result RespDerivs (ServerResponse, MboxUpdate, v))
+                        -> IO (ServerResponse, v)
+sendCommandWithResponse imapc cmdstr pFunc =
     do (buf, num) <- sendCommand' imapc cmdstr
        let (resp, mboxUp, value) = eval pFunc (show6 num) buf
        case resp of
          OK _ _        -> do mboxUpdate imapc mboxUp
-                             return value
+                             return (resp, value)
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
@@ -368,6 +374,11 @@ append conn mbox mailData = appendFull conn mbox mailData Nothing Nothing
 appendFull :: IMAPConnection -> MailboxName -> ByteString
            -> Maybe [Flag] -> Maybe CalendarTime -> IO ()
 appendFull conn mbox mailData flags' time =
+    appendFullUID conn mbox mailData flags' time >> return ()
+
+appendFullUID :: IMAPConnection -> MailboxName -> ByteString
+              -> Maybe [Flag] -> Maybe CalendarTime -> IO (Maybe AppendUID)
+appendFullUID conn mbox mailData flags' time =
     do (buf, num) <- sendCommand' conn
                 (concat ["APPEND ", quoteMailboxName mbox
                         , fstr, tstr, " {" ++ show len ++ "}"])
@@ -378,7 +389,8 @@ appendFull conn mbox mailData flags' time =
        buf2 <- getResponse $ stream conn
        let (resp, mboxUp, ()) = eval pNone (show6 num) buf2
        case resp of
-         OK _ _        -> mboxUpdate conn mboxUp
+         OK stat _     -> do mboxUpdate conn mboxUp
+                             return $ appendUIDFromStatus stat
          NO _ msg      -> fail ("NO: "++msg)
          BAD _ msg     -> fail ("BAD: "++msg)
          PREAUTH _ msg -> fail ("PREAUTH: "++msg)
@@ -386,6 +398,8 @@ appendFull conn mbox mailData flags' time =
     where len       = BS.length mailData
           tstr      = maybe "" ((" "++) . datetimeToStringIMAP) time
           fstr      = maybe "" ((" ("++) . (++")") . unwords . map show) flags'
+          appendUIDFromStatus (Just (APPENDUID_sc appendUID')) = Just appendUID'
+          appendUIDFromStatus _ = Nothing
 
 check :: IMAPConnection -> IO ()
 check conn = sendCommand conn "CHECK" pNone
@@ -508,11 +522,38 @@ store :: IMAPConnection -> UID -> FlagsQuery -> IO ()
 store conn i q = storeFull conn (show i) q True >> return ()
 
 copyFull :: IMAPConnection -> String -> String -> IO ()
-copyFull conn uidStr mbox =
-    sendCommand conn ("UID COPY " ++ uidStr ++ " " ++ quoteMailboxName mbox) pNone
+copyFull conn uidStr mbox = copyUIDFull conn uidStr mbox >> return ()
+
+copyUIDFull :: IMAPConnection -> String -> String -> IO (Maybe CopyUID)
+copyUIDFull conn uidStr mbox =
+    do (resp, ()) <- sendCommandWithResponse conn ("UID COPY " ++ uidStr ++ " " ++ quoteMailboxName mbox) pNone
+       return $ copyUIDFromResponse resp
+  where
+    copyUIDFromResponse (OK (Just (COPYUID_sc copyUID')) _) = Just copyUID'
+    copyUIDFromResponse _ = Nothing
 
 copy :: IMAPConnection -> UID -> MailboxName -> IO ()
 copy conn uid mbox     = copyFull conn (show uid) mbox
+
+copyUID :: IMAPConnection -> UID -> MailboxName -> IO (Maybe CopyUID)
+copyUID conn uid mbox = copyUIDFull conn (show uid) mbox
+
+copyUIDs :: IMAPConnection -> [UID] -> MailboxName -> IO (Maybe CopyUID)
+copyUIDs _ [] _ = fail "copyUIDs: empty UID set"
+copyUIDs conn uids mbox = copyUIDFull conn (showUIDList uids) mbox
+
+copyUIDR :: IMAPConnection -> (UID, UID) -> MailboxName -> IO (Maybe CopyUID)
+copyUIDR conn range mbox = copyUIDFull conn (showUIDRange range) mbox
+
+uidExpunge :: IMAPConnection -> [UID] -> IO [Integer]
+uidExpunge _ [] = fail "uidExpunge: empty UID set"
+uidExpunge conn uids = uidExpungeBySet conn $ showUIDList uids
+
+uidExpungeR :: IMAPConnection -> (UID, UID) -> IO [Integer]
+uidExpungeR conn range = uidExpungeBySet conn $ showUIDRange range
+
+uidExpungeBySet :: IMAPConnection -> UIDSet -> IO [Integer]
+uidExpungeBySet conn uidSet = sendCommand conn ("UID EXPUNGE " ++ uidSet) pExpunge
 
 move :: IMAPConnection -> UID -> MailboxName -> IO ()
 move conn uid mboxname = sendCommand conn ("UID MOVE " ++ show uid ++ " " ++ quoteMailboxName mboxname) pNone
@@ -557,6 +598,12 @@ show4 n | n > 1000 = show n
         | n > 100  = '0' : show n
         | n > 10   = "00" ++ show n
         | otherwise  = "000" ++ show n
+
+showUIDList :: [UID] -> UIDSet
+showUIDList = intercalate "," . map show
+
+showUIDRange :: (UID, UID) -> UIDSet
+showUIDRange (start, end) = show start ++ ":" ++ show end
 
 dateToStringIMAP :: CalendarTime -> String
 dateToStringIMAP date = concat $ intersperse "-" [show2 $ ctDay date

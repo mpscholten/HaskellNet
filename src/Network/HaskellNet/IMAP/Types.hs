@@ -2,11 +2,14 @@ module Network.HaskellNet.IMAP.Types
     ( MailboxName
     , GmailLabel
     , UID
+    , UIDSet
     , Charset
     , MailboxInfo(..)
     , Flag(..)
     , Attribute(..)
     , MboxUpdate(..)
+    , AppendUID(..)
+    , CopyUID(..)
     , StatusCode(..)
     , ServerResponse(..)
     , MailboxStatus(..)
@@ -28,6 +31,7 @@ import Text.Packrat.Pos
 
 type MailboxName = String
 type UID = Word64
+type UIDSet = String
 type Charset = String
 type GmailLabel = String
 
@@ -74,6 +78,19 @@ data MboxUpdate = MboxUpdate { exists :: Maybe Integer
                              , recent :: Maybe Integer }
                 deriving (Show, Eq)
 
+data AppendUID = AppendUID
+    { appendUIDValidity :: UID
+    , appendUID :: UID
+    }
+    deriving (Show, Eq)
+
+data CopyUID = CopyUID
+    { copyUIDValidity :: UID
+    , copyUIDSourceSet :: UIDSet
+    , copyUIDDestinationSet :: UIDSet
+    }
+    deriving (Show, Eq)
+
 data StatusCode = ALERT
                 | BADCHARSET [Charset]
                 | CAPABILITY_sc [String]
@@ -82,8 +99,11 @@ data StatusCode = ALERT
                 | READ_ONLY
                 | READ_WRITE
                 | TRYCREATE
+                | APPENDUID_sc AppendUID
+                | COPYUID_sc CopyUID
                 | UIDNEXT_sc UID
                 | UIDVALIDITY_sc UID
+                | UIDNOTSTICKY
                 | UNSEEN_sc Integer
                   deriving (Eq, Show)
 

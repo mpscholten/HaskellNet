@@ -172,6 +172,18 @@ pStatusCode =
            , stringCI "READ-ONLY" >> return READ_ONLY
            , stringCI "READ-WRITE" >> return READ_WRITE
            , stringCI "TRYCREATE" >> return TRYCREATE
+           , do { stringCI "APPENDUID" >> space
+                ; uidValidity <- pUID
+                ; space
+                ; uid <- pUID
+                ; return $ APPENDUID_sc $ AppendUID uidValidity uid }
+           , do { stringCI "COPYUID" >> space
+                ; uidValidity <- pUID
+                ; space
+                ; sourceSet <- pUIDSet
+                ; space
+                ; destinationSet <- pUIDSet
+                ; return $ COPYUID_sc $ CopyUID uidValidity sourceSet destinationSet }
            , do { stringCI "UNSEEN" >> space
                 ; num <- many1 digit
                 ; return $ UNSEEN_sc $ read num }
@@ -181,9 +193,12 @@ pStatusCode =
            , do { stringCI "UIDVALIDITY" >> space
                 ; num <- many1 digit
                 ; return $ UIDVALIDITY_sc $ read num }
+           , stringCI "UIDNOTSTICKY" >> return UIDNOTSTICKY
            ]
     where parenWords = between (space >> char '(') (char ')')
                          (many1 (noneOf " )") `sepBy1` space)
+          pUID = many1 digit >>= return . read
+          pUIDSet = many1 (digit <|> char ':' <|> char ',')
 
 pFlag :: Parser RespDerivs Flag
 pFlag = do char '\\'
