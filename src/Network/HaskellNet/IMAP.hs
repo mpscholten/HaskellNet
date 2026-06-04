@@ -30,6 +30,7 @@ import Network.HaskellNet.BSStream
 import Network.HaskellNet.IMAP.Connection
 import Network.HaskellNet.IMAP.Parsers
 import Network.HaskellNet.IMAP.Types
+import Network.HaskellNet.IMAP.UTF7
 import Network.Socket (PortNumber)
 
 import Data.ByteString (ByteString)
@@ -81,13 +82,13 @@ instance Show SearchQuery where
               showQuery ALLs            = "ALL"
               showQuery (FLAG f)        = showFlag f
               showQuery (UNFLAG f)      = "UN" ++ showFlag f
-              showQuery (BCCs addr)     = "BCC " ++ addr
+              showQuery (BCCs addr)     = "BCC " ++ quoteIMAPString addr
               showQuery (BEFOREs t)     = "BEFORE " ++ dateToStringIMAP t
-              showQuery (BODYs s)       = "BODY " ++ s
-              showQuery (CCs addr)      = "CC " ++ addr
-              showQuery (FROMs addr)    = "FROM " ++ addr
-              showQuery (HEADERs f v)   = "HEADER " ++ f ++ " " ++ v
-              showQuery (LARGERs siz)   = "LARGER {" ++ show siz ++ "}"
+              showQuery (BODYs s)       = "BODY " ++ quoteIMAPString s
+              showQuery (CCs addr)      = "CC " ++ quoteIMAPString addr
+              showQuery (FROMs addr)    = "FROM " ++ quoteIMAPString addr
+              showQuery (HEADERs f v)   = "HEADER " ++ f ++ " " ++ quoteIMAPString v
+              showQuery (LARGERs siz)   = "LARGER " ++ show siz
               showQuery NEWs            = "NEW"
               showQuery (NOTs qry)      = "NOT " ++ show qry
               showQuery OLDs            = "OLD"
@@ -97,11 +98,11 @@ instance Show SearchQuery where
               showQuery (SENTONs t)     = "SENTON " ++ dateToStringIMAP t
               showQuery (SENTSINCEs t)  = "SENTSINCE " ++ dateToStringIMAP t
               showQuery (SINCEs t)      = "SINCE " ++ dateToStringIMAP t
-              showQuery (SMALLERs siz)  = "SMALLER {" ++ show siz ++ "}"
-              showQuery (SUBJECTs s)    = "SUBJECT " ++ s
-              showQuery (TEXTs s)       = "TEXT " ++ s
-              showQuery (TOs addr)      = "TO " ++ addr
-              showQuery (XGMRAW s)      = "X-GM-RAW " ++ s
+              showQuery (SMALLERs siz)  = "SMALLER " ++ show siz
+              showQuery (SUBJECTs s)    = "SUBJECT " ++ quoteIMAPString s
+              showQuery (TEXTs s)       = "TEXT " ++ quoteIMAPString s
+              showQuery (TOs addr)      = "TO " ++ quoteIMAPString addr
+              showQuery (XGMRAW s)      = "X-GM-RAW " ++ quoteIMAPString s
               showQuery (UIDs uids)     = concat $ intersperse "," $
                                           map show uids
               showFlag Seen        = "SEEN"
@@ -187,11 +188,17 @@ getResponse s = unlinesCRLF <$> getLs
                    then getLiteral l' (getLitLen l2)
                    else return l'
           crlfStr = BS.pack "\r\n"
-          isLiteral l = not (BS.null l) &&
-                        BS.last l == '}' &&
-                        BS.last (fst (BS.spanEnd isDigit (BS.init l))) == '{'
-          getLitLen = read . BS.unpack . snd . BS.spanEnd isDigit . BS.init
-          isTagged l = BS.head l == '*' && BS.head (BS.tail l) == ' '
+          literalLength :: ByteString -> Maybe Int
+          isLiteral = isJust . literalLength
+          getLitLen l = fromMaybe 0 (literalLength l)
+          literalLength l =
+              if BS.length l >= 3 && BS.last l == '}'
+              then let (prefix, digits') = BS.spanEnd isDigit (BS.init l)
+                   in if not (BS.null prefix) && not (BS.null digits') && BS.last prefix == '{'
+                      then Just $ read $ BS.unpack digits'
+                      else Nothing
+              else Nothing
+          isTagged l = BS.length l >= 2 && BS.take 2 l == BS.pack "* "
 
 mboxUpdate :: IMAPConnection -> MboxUpdate -> IO ()
 mboxUpdate conn (MboxUpdate exists' recent') = do
@@ -258,13 +265,12 @@ authenticate conn A.LOGIN username password =
 authenticate conn at username password =
     do (c, num) <- sendCommand' conn $ "AUTHENTICATE " ++ show at
        let challenge =
-               if BS.take 2 c == BS.pack "+ "
-               then A.b64Decode $ BS.unpack $ head $
-                    dropWhile (isSpace . BS.last) $ BS.inits $ BS.drop 2 c
+               if BS.take 1 c == BS.pack "+"
+               then A.b64Decode $ BS.unpack $ strip $ BS.drop 1 c
                else ""
        bsPutCrLf (stream conn) $ BS.pack $
                  A.auth at challenge username password
-       buf <- getResponse $ stream conn
+       buf <- getAuthResponse conn
        let (resp, mboxUp, value) = eval pNone (show6 num) buf
        case resp of
          OK _ _        -> do mboxUpdate conn $ mboxUp
@@ -273,12 +279,17 @@ authenticate conn at username password =
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
 
+getAuthResponse :: IMAPConnection -> IO ByteString
+getAuthResponse conn = do
+    buf <- getResponse $ stream conn
+    if BS.take 1 (strip buf) == BS.pack "+"
+       then bsPutCrLf (stream conn) BS.empty >> getAuthResponse conn
+       else return buf
+
 _select :: String -> IMAPConnection -> String -> IO ()
 _select cmd conn mboxName =
-    do mbox' <- sendCommand conn (cmd ++ quoted mboxName) pSelect
+    do mbox' <- sendCommand conn (cmd ++ quoteMailboxName mboxName) pSelect
        setMailboxInfo conn $ mbox' { _mailbox = mboxName }
-    where
-       quoted s = "\"" ++ s ++ "\""
 
 select :: IMAPConnection -> MailboxName -> IO ()
 select = _select "SELECT "
@@ -287,20 +298,20 @@ examine :: IMAPConnection -> MailboxName -> IO ()
 examine = _select "EXAMINE "
 
 create :: IMAPConnection -> MailboxName -> IO ()
-create conn mboxname = sendCommand conn ("CREATE " ++ mboxname) pNone
+create conn mboxname = sendCommand conn ("CREATE " ++ quoteMailboxName mboxname) pNone
 
 delete :: IMAPConnection -> MailboxName -> IO ()
-delete conn mboxname = sendCommand conn ("DELETE " ++ mboxname) pNone
+delete conn mboxname = sendCommand conn ("DELETE " ++ quoteMailboxName mboxname) pNone
 
 rename :: IMAPConnection -> MailboxName -> MailboxName -> IO ()
 rename conn mboxorg mboxnew =
-    sendCommand conn ("RENAME " ++ mboxorg ++ " " ++ mboxnew) pNone
+    sendCommand conn ("RENAME " ++ quoteMailboxName mboxorg ++ " " ++ quoteMailboxName mboxnew) pNone
 
 subscribe :: IMAPConnection -> MailboxName -> IO ()
-subscribe conn mboxname = sendCommand conn ("SUBSCRIBE " ++ mboxname) pNone
+subscribe conn mboxname = sendCommand conn ("SUBSCRIBE " ++ quoteMailboxName mboxname) pNone
 
 unsubscribe :: IMAPConnection -> MailboxName -> IO ()
-unsubscribe conn mboxname = sendCommand conn ("UNSUBSCRIBE " ++ mboxname) pNone
+unsubscribe conn mboxname = sendCommand conn ("UNSUBSCRIBE " ++ quoteMailboxName mboxname) pNone
 
 list :: IMAPConnection -> IO [([Attribute], MailboxName)]
 list conn = (map (\(a, _, m) -> (a, m))) <$> listFull conn "\"\"" "*"
@@ -319,7 +330,7 @@ lsubFull conn ref pat = sendCommand conn (unwords ["LSUB", ref, pat]) pLsub
 status :: IMAPConnection -> MailboxName -> [MailboxStatus]
        -> IO [(MailboxStatus, Integer)]
 status conn mbox stats =
-    let cmd = "STATUS " ++ mbox ++ " (" ++ (unwords $ map show stats) ++ ")"
+    let cmd = "STATUS " ++ quoteMailboxName mbox ++ " (" ++ (unwords $ map show stats) ++ ")"
     in sendCommand conn cmd pStatus
 
 append :: IMAPConnection -> MailboxName -> ByteString -> IO ()
@@ -329,11 +340,11 @@ appendFull :: IMAPConnection -> MailboxName -> ByteString
            -> Maybe [Flag] -> Maybe CalendarTime -> IO ()
 appendFull conn mbox mailData flags' time =
     do (buf, num) <- sendCommand' conn
-                (concat ["APPEND ", mbox
+                (concat ["APPEND ", quoteMailboxName mbox
                         , fstr, tstr, " {" ++ show len ++ "}"])
        when (BS.null buf || (BS.head buf /= '+')) $
               fail "illegal server response"
-       mapM_ (bsPutCrLf $ stream conn) mailLines
+       bsPut (stream conn) mailData
        bsPutCrLf (stream conn) BS.empty
        buf2 <- getResponse $ stream conn
        let (resp, mboxUp, ()) = eval pNone (show6 num) buf2
@@ -342,8 +353,7 @@ appendFull conn mbox mailData flags' time =
          NO _ msg      -> fail ("NO: "++msg)
          BAD _ msg     -> fail ("BAD: "++msg)
          PREAUTH _ msg -> fail ("PREAUTH: "++msg)
-    where mailLines = BS.lines mailData
-          len       = sum $ map ((2+) . BS.length) mailLines
+    where len       = BS.length mailData
           tstr      = maybe "" ((" "++) . datetimeToStringIMAP) time
           fstr      = maybe "" ((" ("++) . (++")") . unwords . map show) flags'
 
@@ -429,7 +439,9 @@ fetchByString :: IMAPConnection -> UID -> String
               -> IO [(String, String)]
 fetchByString conn uid command =
     do lst <- fetchCommand conn ("UID FETCH "++show uid++" "++command) id
-       return $ snd $ head lst
+       case lst of
+         (_, pairs):_ -> return pairs
+         [] -> return []
 
 fetchByStringR :: IMAPConnection -> (UID, UID) -> String
                -> IO [(UID, [(String, String)])]
@@ -447,18 +459,19 @@ storeFull :: IMAPConnection -> String -> FlagsQuery -> Bool
           -> IO [(UID, [Flag])]
 storeFull conn uidstr query isSilent =
     fetchCommand conn ("UID STORE " ++ uidstr ++ " " ++ flgs query) procStore
-    where fstrs fs = "(" ++ (concat $ intersperse " " $ map show fs) ++ ")"
+    where flagList fs = "(" ++ (concat $ intersperse " " $ map show fs) ++ ")"
+          labelList ls = "(" ++ (concat $ intersperse " " $ map quoteIMAPString ls) ++ ")"
           toFStr s fstrs' =
               s ++ (if isSilent then ".SILENT" else "") ++ " " ++ fstrs'
-          flgs (ReplaceGmailLabels ls) = toFStr "X-GM-LABELS" $ fstrs ls
-          flgs (PlusGmailLabels ls)    = toFStr "+X-GM-LABELS" $ fstrs ls
-          flgs (MinusGmailLabels ls)   = toFStr "-X-GM-LABELS" $ fstrs ls
-          flgs (ReplaceFlags fs)       = toFStr "FLAGS" $ fstrs fs
-          flgs (PlusFlags fs)          = toFStr "+FLAGS" $ fstrs fs
-          flgs (MinusFlags fs)         = toFStr "-FLAGS" $ fstrs fs
+          flgs (ReplaceGmailLabels ls) = toFStr "X-GM-LABELS" $ labelList ls
+          flgs (PlusGmailLabels ls)    = toFStr "+X-GM-LABELS" $ labelList ls
+          flgs (MinusGmailLabels ls)   = toFStr "-X-GM-LABELS" $ labelList ls
+          flgs (ReplaceFlags fs)       = toFStr "FLAGS" $ flagList fs
+          flgs (PlusFlags fs)          = toFStr "+FLAGS" $ flagList fs
+          flgs (MinusFlags fs)         = toFStr "-FLAGS" $ flagList fs
           procStore (n, ps) = (maybe (toEnum (fromIntegral n)) read
                                          (lookup' "UID" ps)
-                              ,maybe [] (eval' dvFlags "") (lookup' "FLAG" ps))
+                              ,maybe [] (eval' dvFlags "") (lookup' "FLAGS" ps))
 
 
 store :: IMAPConnection -> UID -> FlagsQuery -> IO ()
@@ -466,16 +479,25 @@ store conn i q = storeFull conn (show i) q True >> return ()
 
 copyFull :: IMAPConnection -> String -> String -> IO ()
 copyFull conn uidStr mbox =
-    sendCommand conn ("UID COPY " ++ uidStr ++ " " ++ mbox) pNone
+    sendCommand conn ("UID COPY " ++ uidStr ++ " " ++ quoteMailboxName mbox) pNone
 
 copy :: IMAPConnection -> UID -> MailboxName -> IO ()
 copy conn uid mbox     = copyFull conn (show uid) mbox
 
 move :: IMAPConnection -> UID -> MailboxName -> IO ()
-move conn uid mboxname = sendCommand conn ("UID MOVE " ++ show uid ++ " " ++ mboxname) pNone
+move conn uid mboxname = sendCommand conn ("UID MOVE " ++ show uid ++ " " ++ quoteMailboxName mboxname) pNone
 
 ----------------------------------------------------------------------
 -- auxialiary functions
+
+quoteMailboxName :: MailboxName -> String
+quoteMailboxName = quoteIMAPString . encodeMailboxName
+
+quoteIMAPString :: String -> String
+quoteIMAPString s = "\"" ++ concatMap escapeChar s ++ "\""
+    where escapeChar '"' = "\\\""
+          escapeChar '\\' = "\\\\"
+          escapeChar c = [c]
 
 showMonth :: Month -> String
 showMonth January   = "Jan"
@@ -537,10 +559,24 @@ bsPutCrLf h s = bsPut h s >> bsPut h crlf >> bsFlush h
 
 lookup' :: String -> [(String, b)] -> Maybe b
 lookup' _ [] = Nothing
-lookup' q ((k,v):xs) | q == query k  = return v
+lookup' q ((k,v):xs) | matchesFetchKey q k = return v
                      | otherwise        = lookup' q xs
-    where
-        query = unwords . drop 2 . words
+
+matchesFetchKey :: String -> String -> Bool
+matchesFetchKey expected actual =
+    expected == actual || normalizeFetchKey expected == normalizeFetchKey actual
+
+normalizeFetchKey :: String -> String
+normalizeFetchKey = stripOrigin . stripPeek
+  where
+    stripPeek key =
+        case stripPrefix "BODY.PEEK[" key of
+          Just rest -> "BODY[" ++ rest
+          Nothing -> key
+    stripOrigin key =
+        case break (== '<') key of
+          (bodySection, '<':_) | "BODY[" `isPrefixOf` bodySection -> bodySection
+          _ -> key
 
 -- TODO: This is just a first trial solution for this stack overflow question:
 --       http://stackoverflow.com/questions/26183675/error-when-fetching-subject-from-email-using-haskellnets-imap

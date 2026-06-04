@@ -23,6 +23,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS
 
 import Network.HaskellNet.IMAP.Types
+import Network.HaskellNet.IMAP.UTF7
 
 eval :: (RespDerivs -> Result RespDerivs r) -> String -> ByteString -> r
 eval pMain tag s = case pMain (parse tag (Pos tag 1 1) s) of
@@ -199,7 +200,23 @@ Parser pParenFlags = do char '('
                         return fs
 
 atomChar :: Derivs d => Parser d Char
-atomChar = noneOf " (){%*\"\\]"
+atomChar = noneOf " (){%*\"\\]\r\n"
+
+pQuotedString :: Parser RespDerivs String
+pQuotedString = between (char '"') (char '"') (many quotedChar)
+    where quotedChar = (char '\\' >> anyChar) <|> noneOf "\"\\\r\n"
+
+pLiteralString :: Parser RespDerivs String
+pLiteralString = do char '{'
+                    num <- many1 digit >>= return . read
+                    char '}' >> crlfP
+                    sequence $ replicate num anyChar
+
+pAString :: Parser RespDerivs String
+pAString = pQuotedString <|> pLiteralString <|> many1 atomChar
+
+pMailboxName :: Parser RespDerivs MailboxName
+pMailboxName = decodeMailboxName <$> pAString
 
 pNumberedLine :: String -> Parser RespDerivs Integer
 pNumberedLine str = do num <- many1 digit
@@ -247,19 +264,17 @@ pListLine list =
                           attrs <- parseAttr `sepBy` space
                           char ')'
                           return attrs
-          parseSep = space >> char '"' >> anyChar `manyTill` char '"'
+          parseSep = space >> ((string "NIL" >> return "") <|> pQuotedString)
           parseMailbox = do space
-                            q <- optional $ char '"'
-                            case q of
-                                Just _  -> do mbox <- anyChar `manyTill` char '"'
-                                              anyChar `manyTill` crlfP
-                                              return mbox
-                                Nothing -> anyChar `manyTill` crlfP
+                            mbox <- pMailboxName
+                            crlfP
+                            return mbox
 
 pStatusLine :: Parser RespDerivs (Either a [(MailboxStatus, Integer)])
 pStatusLine =
     do string "* STATUS "
-       _ <- anyChar `manyTill` space
+       _ <- pMailboxName
+       space
        stats <- between (char '(') (char ')') (parseStat `sepBy1` space)
        crlfP
        return $ Right stats
@@ -327,27 +342,31 @@ pFetchLine =
        pairs <- pPair `manyTill` char ')'
        crlfP
        return $ Right $ (read num, pairs)
-    where pPair = do key <- (do k  <- anyChar `manyTill` char '['
-                                ps <- anyChar `manyTill` char ']'
-                                space
-                                return (k++"["++ps++"]"))
-                        <|> anyChar `manyTill` space
-                     value <- (do char '('
-                                  v <- pParen `sepBy` space
-                                  char ')'
-                                  return ("("++unwords v++")"))
-                          <|> (do char '{'
-                                  num <- many1 digit >>= return . read
-                                  char '}' >> crlfP
-                                  sequence $ replicate num anyChar)
-                          <|> (do char '"'
-                                  v <- noneOf "\"" `manyTill` char '"'
-                                  return ("\""++v++"\""))
-                          <|> many1 atomChar
+    where pPair = do key <- pFetchKey
+                     value <- pFetchValue
                      spaces
                      return (key, value)
-          pParen = (do char '"'
-                       v <- noneOf "\"" `manyTill` char '"'
+          pFetchKey = do name <- many1 (noneOf " [)\r\n")
+                         section <- option "" pSection
+                         space
+                         return (name ++ section)
+          pSection = do char '['
+                        ps <- anyChar `manyTill` char ']'
+                        origin <- option "" pOrigin
+                        return ("[" ++ ps ++ "]" ++ origin)
+          pOrigin = do char '<'
+                       n <- many1 digit
+                       char '>'
+                       return ("<" ++ n ++ ">")
+          pFetchValue = (do char '('
+                            v <- pParen `sepBy` space
+                            char ')'
+                            return ("("++unwords v++")"))
+                    <|> pLiteralString
+                    <|> (do v <- pQuotedString
+                            return ("\""++v++"\""))
+                    <|> many1 atomChar
+          pParen = (do v <- pQuotedString
                        return ("\""++v++"\""))
                <|> (do char '('
                        v <- pParen `sepBy` space
