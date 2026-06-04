@@ -35,6 +35,8 @@ import Network.Socket (PortNumber)
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as TextEncoding
 
 import Control.Monad
 
@@ -134,18 +136,33 @@ connectIMAP hostname = connectIMAPPort hostname 143
 connectStream :: BSStream -> IO IMAPConnection
 connectStream s =
     do msg <- bsGetLine s
-       unless (and $ BS.zipWith (==) msg (BS.pack "* OK")) $
+       unless (isAcceptedGreeting msg) $
               fail "cannot connect to the server"
        newConnection s
+    where
+      isAcceptedGreeting msg =
+          case BS.words msg of
+            [star, greetingStatus] ->
+                star == BS.pack "*" && isReadyStatus greetingStatus
+            (star:greetingStatus:_) ->
+                star == BS.pack "*" && isReadyStatus greetingStatus
+            _ -> False
+      isReadyStatus greetingStatus =
+          let upperStatus = BS.map toUpper greetingStatus
+          in upperStatus == BS.pack "OK" || upperStatus == BS.pack "PREAUTH"
 
 ----------------------------------------------------------------------
 -- normal send commands
 sendCommand' :: IMAPConnection -> String -> IO (ByteString, Int)
 sendCommand' c cmdstr = do
-  (_, num) <- withNextCommandNum c $ \num -> bsPutCrLf (stream c) $
-              BS.pack $ show6 num ++ " " ++ cmdstr
+  (_, num) <- withNextCommandNum c $ \num -> do
+              let bytes = encodeUtf8 $ show6 num ++ " " ++ cmdstr
+              BS.length bytes `seq` bsPutCrLf (stream c) bytes
   resp <- getResponse (stream c)
   return (resp, num)
+
+encodeUtf8 :: String -> ByteString
+encodeUtf8 = TextEncoding.encodeUtf8 . Text.pack
 
 show6 :: (Ord a, Num a, Show a) => a -> String
 show6 n | n > 100000 = show n
@@ -167,6 +184,7 @@ sendCommand imapc cmdstr pFunc =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
+         BYE _ msg     -> fail ("BYE: " ++ msg)
 
 getResponse :: BSStream -> IO ByteString
 getResponse s = unlinesCRLF <$> getLs
@@ -193,11 +211,19 @@ getResponse s = unlinesCRLF <$> getLs
           getLitLen l = fromMaybe 0 (literalLength l)
           literalLength l =
               if BS.length l >= 3 && BS.last l == '}'
-              then let (prefix, digits') = BS.spanEnd isDigit (BS.init l)
-                   in if not (BS.null prefix) && not (BS.null digits') && BS.last prefix == '{'
-                      then Just $ read $ BS.unpack digits'
-                      else Nothing
+              then parseLiteralTail $ reverse $ BS.unpack $ BS.init l
               else Nothing
+          parseLiteralTail revBeforeClose =
+              case break (== '{') revBeforeClose of
+                (insideRev, _ : _) -> parseLiteralInside $ reverse insideRev
+                _ -> Nothing
+          parseLiteralInside inside =
+              let digits' = case reverse inside of
+                              '+' : rest -> reverse rest
+                              _ -> inside
+              in if not (null digits') && all isDigit digits'
+                 then Just $ read digits'
+                 else Nothing
           isTagged l = BS.length l >= 2 && BS.take 2 l == BS.pack "* "
 
 mboxUpdate :: IMAPConnection -> MboxUpdate -> IO ()
@@ -231,6 +257,7 @@ idle conn timeout =
          NO _ msg -> fail ("NO: " ++ msg)
          BAD _ msg -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
+         BYE _ msg -> fail ("BYE: " ++ msg)
 
 noop :: IMAPConnection -> IO ()
 noop conn = sendCommand conn "NOOP" pNone
@@ -261,6 +288,7 @@ authenticate conn A.LOGIN username password =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
+         BYE _ msg     -> fail ("BYE: " ++ msg)
     where (userB64, passB64) = A.login username password
 authenticate conn at username password =
     do (c, num) <- sendCommand' conn $ "AUTHENTICATE " ++ show at
@@ -278,6 +306,7 @@ authenticate conn at username password =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
+         BYE _ msg     -> fail ("BYE: " ++ msg)
 
 getAuthResponse :: IMAPConnection -> IO ByteString
 getAuthResponse conn = do
@@ -353,6 +382,7 @@ appendFull conn mbox mailData flags' time =
          NO _ msg      -> fail ("NO: "++msg)
          BAD _ msg     -> fail ("BAD: "++msg)
          PREAUTH _ msg -> fail ("PREAUTH: "++msg)
+         BYE _ msg     -> fail ("BYE: "++msg)
     where len       = BS.length mailData
           tstr      = maybe "" ((" "++) . datetimeToStringIMAP) time
           fstr      = maybe "" ((" ("++) . (++")") . unwords . map show) flags'
@@ -495,9 +525,13 @@ quoteMailboxName = quoteIMAPString . encodeMailboxName
 
 quoteIMAPString :: String -> String
 quoteIMAPString s = "\"" ++ concatMap escapeChar s ++ "\""
-    where escapeChar '"' = "\\\""
+    where escapeChar c
+              | isIllegalQuotedStringChar c =
+                  error "quoteIMAPString: IMAP quoted string contains illegal control character"
+          escapeChar '"' = "\\\""
           escapeChar '\\' = "\\\\"
           escapeChar c = [c]
+          isIllegalQuotedStringChar c = isControl c || c == '\DEL'
 
 showMonth :: Month -> String
 showMonth January   = "Jan"
@@ -567,7 +601,7 @@ matchesFetchKey expected actual =
     expected == actual || normalizeFetchKey expected == normalizeFetchKey actual
 
 normalizeFetchKey :: String -> String
-normalizeFetchKey = stripOrigin . stripPeek
+normalizeFetchKey = stripOrigin . stripPeek . map toUpper
   where
     stripPeek key =
         case stripPrefix "BODY.PEEK[" key of
@@ -583,12 +617,4 @@ normalizeFetchKey = stripOrigin . stripPeek
 --       It must be reviewed. References: rfc3501#6.2.3, rfc2683#3.4.2.
 --       This function was tested against the password: `~1!2@3#4$5%6^7&8*9(0)-_=+[{]}\|;:'",<.>/? (with spaces in the laterals).
 escapeLogin :: String -> String
-escapeLogin x = "\"" ++ replaceSpecialChars x ++ "\""
-    where
-        replaceSpecialChars ""     = ""
-        replaceSpecialChars (c:cs) = escapeChar c ++ replaceSpecialChars cs
-        escapeChar '"' = "\\\""
-        escapeChar '\\' = "\\\\"
-        escapeChar '{' = "\\{"
-        escapeChar '}' = "\\}"
-        escapeChar s   = [s]
+escapeLogin = quoteIMAPString

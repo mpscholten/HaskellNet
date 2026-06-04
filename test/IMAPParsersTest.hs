@@ -2,6 +2,7 @@ module Main (main) where
 
 import Control.Exception (SomeException, try, displayException)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BS
 import Data.IORef
 import Data.List (isInfixOf)
@@ -17,11 +18,11 @@ import Test.HUnit
 
 data ReadStep = ReadLine ByteString | ReadBytes ByteString
 
-scriptedConnection :: [ReadStep] -> IO (IMAPConnection, IO ByteString)
-scriptedConnection steps = do
+scriptedStream :: [ReadStep] -> IO (BSStream, IO ByteString)
+scriptedStream steps = do
     input <- newIORef steps
     output <- newIORef []
-    conn <- newConnection BSStream
+    return (BSStream
         { bsGetLine = popLine input
         , bsGet = popBytes input
         , bsPut = \bytes -> modifyIORef' output (bytes:)
@@ -29,8 +30,7 @@ scriptedConnection steps = do
         , bsClose = return ()
         , bsIsOpen = return True
         , bsWaitForInput = \_ -> return False
-        }
-    return (conn, BS.concat . reverse <$> readIORef output)
+        }, BS.concat . reverse <$> readIORef output)
   where
     popLine input = do
         steps' <- readIORef input
@@ -48,6 +48,12 @@ scriptedConnection steps = do
                 in writeIORef input next >> return chunk
             ReadLine _ : _ -> assertFailure "expected test stream bytes, got a line"
             [] -> assertFailure "test stream exhausted while reading bytes"
+
+scriptedConnection :: [ReadStep] -> IO (IMAPConnection, IO ByteString)
+scriptedConnection steps = do
+    (testStream, written) <- scriptedStream steps
+    conn <- newConnection testStream
+    return (conn, written)
 
 line :: String -> ReadStep
 line = ReadLine . BS.pack
@@ -78,6 +84,14 @@ assertThrowsContaining name expected action =
 commandBytes :: String -> ByteString
 commandBytes cmd = BS.pack (cmd ++ "\r\n")
 
+utf8SubjectSearchBytes :: ByteString
+utf8SubjectSearchBytes =
+    BS.concat
+        [ BS.pack "000000 UID SEARCH SUBJECT \"M"
+        , B.pack [0xc3, 0xbc]
+        , BS.pack "ller\"\r\n"
+        ]
+
 baseTest =
     [(OK Nothing "LOGIN Completed", MboxUpdate Nothing Nothing, ())
      ~=? eval' pNone "A001"
@@ -92,6 +106,12 @@ baseTest =
      ~=? eval' pNone "a006"
              "* BYE Courier-IMAP server shutting down\r\n\
              \a006 OK LOGOUT completed\r\n"
+    ,(BYE Nothing "Server logging out", MboxUpdate Nothing Nothing, ())
+     ~=? eval' pNone "a001"
+             "* BYE Server logging out\r\n"
+    ,(OK Nothing "done", MboxUpdate Nothing Nothing, ())
+     ~=? eval' pNone "a002"
+             "a002 ok done\r\n"
     ]
 
 capabilityTest =
@@ -168,6 +188,11 @@ listTest =
                                \* LIST () \"/\" \"foo\\\"bar\"\r\n\
                                \* LIST () \"/\" Entw&APw-rfe\r\n\
                                \A003 OK LIST completed\r\n"
+    , ( OK Nothing "LIST completed"
+      , MboxUpdate Nothing Nothing
+      , [([], "/", "&?-")])
+      ~=? eval' pList "A004" "* LIST () \"/\" &?-\r\n\
+                             \A004 OK LIST completed\r\n"
     ]
 
 statusTest =
@@ -256,6 +281,30 @@ fetchTest =
           , [(12, [("FLAGS", "(\\Seen \\Deleted)")])])
       ~=? eval' pFetch "a005" "* 12 FETCH (FLAGS (\\Seen \\Deleted))\r\n\
 	                              \a005 OK +FLAGS completed\r\n"
+    , ( OK Nothing "FETCH completed"
+          , MboxUpdate Nothing Nothing
+          , [(12, [("FLAGS", "(\\Seen)"), ("UID", "42")])])
+      ~=? eval' pFetch "a006" "* 12 fetch (flags (\\Seen) uid 42)\r\n\
+                                  \a006 OK FETCH completed\r\n"
+    , ( OK Nothing "FETCH completed"
+          , MboxUpdate Nothing Nothing
+          , [(12, [("BODY[]", "hello\r\n")
+                  ,("UID", "12")
+                  ,("FLAGS", "(\\Seen)")])])
+      ~=? eval' pFetch "a007" "* 12 FETCH (BODY[] {7}\r\n\
+                                  \hello\r\n\
+                                  \UID 12 FLAGS (\\Seen))\r\n\
+                                  \a007 OK FETCH completed\r\n"
+    ]
+
+imapConnectTest =
+    [ "connect accepts preauth greeting" ~: TestCase $ do
+          (testStream, _) <- scriptedStream [line "* PREAUTH already logged in"]
+          _ <- IMAP.connectStream testStream
+          return ()
+    , assertThrowsContaining "connect rejects empty greeting" "cannot connect"
+          (do (testStream, _) <- scriptedStream [line ""]
+              IMAP.connectStream testStream)
     ]
 
 imapCommandTest =
@@ -329,6 +378,22 @@ imapFetchTest =
           case result of
               [(uid, _)] -> 4827313 @=? uid
               _ -> assertFailure "expected one fetch result"
+    , "fetch treats nil body as empty" ~: TestCase $ do
+          (conn, _) <- scriptedConnection
+              [ line "* 12 FETCH (BODY[] NIL UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetch conn 42
+          BS.empty @=? fetched
+    , "fetch accepts non-sync literals" ~: TestCase $ do
+          (conn, _) <- scriptedConnection
+              [ line "* 12 FETCH (BODY[] {5+}"
+              , bytes "hello"
+              , line " UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetch conn 42
+          BS.pack "hello" @=? fetched
     ]
 
 imapAppendTest =
@@ -357,6 +422,23 @@ imapSearchTest =
           commandBytes "000000 UID SEARCH FROM \"Alice Smith\"" @=? actual
     , "keyword flag renders without system slash" ~:
           "clientKeyword" ~=? show (Keyword "clientKeyword")
+    , "search writes unicode as utf8" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ line "* SEARCH"
+              , okLine "SEARCH completed"
+              ]
+          searchResult <- IMAP.search conn [IMAP.SUBJECTs "Müller"]
+          [] @=? searchResult
+          actual <- written
+          utf8SubjectSearchBytes @=? actual
+    , assertThrowsContaining "search rejects crlf injection" "control character"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.search conn [IMAP.FROMs "Alice\r\nNOOP"])
+    ]
+
+imapFlagTest =
+    [ "unknown backslash flag preserves slash" ~:
+          [Keyword "\\Custom"] ~=? eval' dvFlags "" "(\\Custom)"
     ]
 
 imapAuthTest =
@@ -378,10 +460,12 @@ testData = [ "base" ~: baseTest
            , "expunge" ~: expungeTest
            , "search" ~: searchTest
            , "fetch" ~: fetchTest
+           , "imap connect api" ~: imapConnectTest
            , "imap commands" ~: imapCommandTest
            , "imap fetch api" ~: imapFetchTest
            , "imap append api" ~: imapAppendTest
            , "imap search api" ~: imapSearchTest
+           , "imap flag parser" ~: imapFlagTest
            , "imap auth api" ~: imapAuthTest
            ]
 

@@ -10,6 +10,7 @@ import Data.Char (ord)
 import Data.Word (Word8)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
+import qualified Data.Text.Encoding.Error as TextEncodingError
 
 encodeMailboxName :: String -> String
 encodeMailboxName [] = []
@@ -28,11 +29,24 @@ decodeMailboxName [] = []
 decodeMailboxName ('&':'-':cs) = '&' : decodeMailboxName cs
 decodeMailboxName ('&':cs) =
     let (encoded, rest) = break (== '-') cs
-        decoded = Text.unpack $ TextEncoding.decodeUtf16BE $ B.pack $ decodeBase64 encoded
-    in decoded ++ decodeMailboxName (dropDash rest)
+        rest' = dropDash rest
+        shifted = '&' : encoded ++ dash rest
+    in case rest of
+         '-' : _ ->
+             case decodeBase64 encoded of
+               Just decoded
+                   | even (length decoded) ->
+                       Text.unpack (TextEncoding.decodeUtf16BEWith
+                                        TextEncodingError.lenientDecode
+                                        (B.pack decoded))
+                       ++ decodeMailboxName rest'
+               _ -> shifted ++ decodeMailboxName rest'
+         _ -> shifted ++ decodeMailboxName rest'
   where
     dropDash ('-':rest) = rest
     dropDash rest = rest
+    dash ('-':_) = "-"
+    dash _ = ""
 decodeMailboxName (c:cs) = c : decodeMailboxName cs
 
 isDirect :: Char -> Bool
@@ -62,28 +76,30 @@ encodeBase64 (a:b:c:rest) =
 alphabetAt :: Int -> Char
 alphabetAt n = alphabet !! n
 
-decodeBase64 :: String -> [Word8]
-decodeBase64 [] = []
+decodeBase64 :: String -> Maybe [Word8]
+decodeBase64 [] = Just []
 decodeBase64 chars =
     let (chunk, rest) = splitAt 4 chars
-    in decodeChunk (map base64Value chunk) ++ decodeBase64 rest
+    in do decodedChunk <- traverse base64Value chunk >>= decodeChunk
+          decodedRest <- decodeBase64 rest
+          return (decodedChunk ++ decodedRest)
 
-decodeChunk :: [Int] -> [Word8]
+decodeChunk :: [Int] -> Maybe [Word8]
 decodeChunk [a, b] =
-    [fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)]
+    Just [fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)]
 decodeChunk [a, b, c] =
-    [ fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)
-    , fromIntegral $ ((b .&. 0x0f) `shiftL` 4) .|. (c `shiftR` 2)
-    ]
+    Just [ fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)
+         , fromIntegral $ ((b .&. 0x0f) `shiftL` 4) .|. (c `shiftR` 2)
+         ]
 decodeChunk [a, b, c, d] =
-    [ fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)
-    , fromIntegral $ ((b .&. 0x0f) `shiftL` 4) .|. (c `shiftR` 2)
-    , fromIntegral $ ((c .&. 0x03) `shiftL` 6) .|. d
-    ]
-decodeChunk _ = []
+    Just [ fromIntegral $ (a `shiftL` 2) .|. (b `shiftR` 4)
+         , fromIntegral $ ((b .&. 0x0f) `shiftL` 4) .|. (c `shiftR` 2)
+         , fromIntegral $ ((c .&. 0x03) `shiftL` 6) .|. d
+         ]
+decodeChunk _ = Nothing
 
-base64Value :: Char -> Int
+base64Value :: Char -> Maybe Int
 base64Value c =
     case lookup c (zip alphabet [0..]) of
-      Just n -> n
-      Nothing -> 0
+      Just n -> Just n
+      Nothing -> Nothing
