@@ -3,6 +3,18 @@
 This document explains how to update package between major versions
 of the package.
 
+Current master
+==============
+
+1. IMAP `search` now sends `CHARSET UTF-8` automatically when string
+   search keys contain non-ASCII text. Use `searchCharset` to provide an
+   explicit search charset or search prefix.
+2. IMAP command builders now reject CR, LF, and NUL in user-supplied
+   command text before sending.
+3. UIDPLUS support adds `appendFullUID`, `copyUID`, `copyUIDs`,
+   `copyUIDR`, `copyUIDSet`, `uidExpunge`, `uidExpungeR`, and
+   `uidExpungeSet`.
+
 0.5.x -> 0.6
 ============
 

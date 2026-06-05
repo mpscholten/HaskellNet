@@ -87,7 +87,7 @@ commandBytes cmd = BS.pack (cmd ++ "\r\n")
 utf8SubjectSearchBytes :: ByteString
 utf8SubjectSearchBytes =
     BS.concat
-        [ BS.pack "000000 UID SEARCH SUBJECT \"M"
+        [ BS.pack "000000 UID SEARCH CHARSET UTF-8 SUBJECT \"M"
         , B.pack [0xc3, 0xbc]
         , BS.pack "ller\"\r\n"
         ]
@@ -106,7 +106,7 @@ baseTest =
      ~=? eval' pNone "a006"
              "* BYE Courier-IMAP server shutting down\r\n\
              \a006 OK LOGOUT completed\r\n"
-    ,(BYE Nothing "Server logging out", MboxUpdate Nothing Nothing, ())
+    ,(BAD Nothing "BYE: Server logging out", MboxUpdate Nothing Nothing, ())
      ~=? eval' pNone "a001"
              "* BYE Server logging out\r\n"
     ,(OK Nothing "done", MboxUpdate Nothing Nothing, ())
@@ -118,6 +118,9 @@ baseTest =
     ,(OK (Just (COPYUID_sc (CopyUID 38505 "304,319:320" "3956:3958"))) "COPY completed", MboxUpdate Nothing Nothing, ())
      ~=? eval' pNone "a004"
              "a004 OK [COPYUID 38505 304,319:320 3956:3958] COPY completed\r\n"
+    ,(OK (Just (COPYUID_sc (CopyUID 123 "1:*" "7:*"))) "COPY completed", MboxUpdate Nothing Nothing, ())
+     ~=? eval' pNone "a004"
+             "a004 OK [COPYUID 123 1:* 7:*] COPY completed\r\n"
     ,(NO (Just UIDNOTSTICKY) "UIDs are not sticky", MboxUpdate Nothing Nothing, ())
      ~=? eval' pNone "a005"
              "a005 NO [UIDNOTSTICKY] UIDs are not sticky\r\n"
@@ -362,6 +365,21 @@ imapCommandTest =
           (commandBytes "000000 UID MOVE 42 \"foo bar\"")
           [okLine "MOVE completed"]
           (\conn -> IMAP.move conn 42 "foo bar")
+    , assertThrowsContaining "login rejects crlf username" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.login conn "alice\r\nNOOP" "secret")
+    , assertThrowsContaining "login rejects nul password" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.login conn "alice" "sec\0ret")
+    , assertThrowsContaining "gmail label rejects crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.store conn 42 (IMAP.PlusGmailLabels ["Work\r\nNOOP"]))
+    , assertThrowsContaining "flag keyword rejects crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.store conn 42 (IMAP.PlusFlags [Keyword "Work\r\nNOOP"]))
+    , assertThrowsContaining "mailbox rejects crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.create conn "Archive\r\nNOOP")
     ]
 
 imapFetchTest =
@@ -403,6 +421,12 @@ imapFetchTest =
               ]
           fetched <- IMAP.fetch conn 42
           BS.pack "hello" @=? fetched
+    , assertThrowsContaining "fetch command rejects crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.fetchByString conn 42 "FLAGS\r\nNOOP")
+    , assertThrowsContaining "fetch header field rejects crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.fetchHeaderFields conn 42 ["Subject\r\nNOOP"])
     ]
 
 imapAppendTest =
@@ -453,6 +477,13 @@ imapUIDPlusTest =
           Just (CopyUID 38505 "42,44" "991,993") @=? result
           actual <- written
           commandBytes "000000 UID COPY 42,44 \"Archive\"" @=? actual
+    , "copyUIDSet sends raw uid set" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ okLine "[COPYUID 38505 1:* 7:*] COPY completed" ]
+          result <- IMAP.copyUIDSet conn "1:*" "Archive"
+          Just (CopyUID 38505 "1:*" "7:*") @=? result
+          actual <- written
+          commandBytes "000000 UID COPY 1:* \"Archive\"" @=? actual
     , "uidExpunge sends uid set" ~: TestCase $ do
           (conn, written) <- scriptedConnection
               [ line "* 3 EXPUNGE"
@@ -472,10 +503,28 @@ imapUIDPlusTest =
           [4] @=? result
           actual <- written
           commandBytes "000000 UID EXPUNGE 3000:3002" @=? actual
+    , "uidExpungeSet sends raw uid set" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ line "* 4 EXPUNGE"
+              , okLine "UID EXPUNGE completed"
+              ]
+          result <- IMAP.uidExpungeSet conn "1:*"
+          [4] @=? result
+          actual <- written
+          commandBytes "000000 UID EXPUNGE 1:*" @=? actual
+    , assertThrowsContaining "copyUIDSet rejects invalid uid set" "invalid characters"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.copyUIDSet conn "1\r\nNOOP" "Archive")
+    , assertThrowsContaining "uidExpungeSet rejects nul uid set" "invalid characters"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.uidExpungeSet conn "1\0")
+    , assertThrowsContaining "uidExpungeSet rejects empty uid set" "must not be empty"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.uidExpungeSet conn "")
     ]
 
 imapSearchTest =
-    [ "search quotes string values" ~: TestCase $ do
+    [ "ascii search does not add charset" ~: TestCase $ do
           (conn, written) <- scriptedConnection
               [ line "* SEARCH"
               , okLine "SEARCH completed"
@@ -495,9 +544,43 @@ imapSearchTest =
           [] @=? searchResult
           actual <- written
           utf8SubjectSearchBytes @=? actual
-    , assertThrowsContaining "search rejects crlf injection" "control character"
+    , "search detects nested unicode text" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ line "* SEARCH"
+              , okLine "SEARCH completed"
+              ]
+          searchResult <- IMAP.search conn [IMAP.ORs IMAP.ALLs (IMAP.NOTs (IMAP.SUBJECTs "Müller"))]
+          [] @=? searchResult
+          actual <- written
+          BS.concat
+              [ BS.pack "000000 UID SEARCH CHARSET UTF-8 OR ALL NOT SUBJECT \"M"
+              , B.pack [0xc3, 0xbc]
+              , BS.pack "ller\"\r\n"
+              ] @=? actual
+    , "searchCharset uses explicit prefix" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ line "* SEARCH"
+              , okLine "SEARCH completed"
+              ]
+          searchResult <- IMAP.searchCharset conn "CHARSET ISO-8859-1" [IMAP.SUBJECTs "Muller"]
+          [] @=? searchResult
+          actual <- written
+          commandBytes "000000 UID SEARCH CHARSET ISO-8859-1 SUBJECT \"Muller\"" @=? actual
+    , assertThrowsContaining "search rejects crlf injection" "CR, LF, or NUL"
           (do (conn, _) <- scriptedConnection []
               IMAP.search conn [IMAP.FROMs "Alice\r\nNOOP"])
+    , assertThrowsContaining "search rejects nul text" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.search conn [IMAP.TEXTs "bad\0text"])
+    , assertThrowsContaining "search rejects header field crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.search conn [IMAP.HEADERs "Subject\r\nNOOP" "hello"])
+    , assertThrowsContaining "search rejects flag keyword crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.search conn [IMAP.FLAG (Keyword "Work\r\nNOOP")])
+    , assertThrowsContaining "searchCharset rejects raw charset crlf" "CR, LF, or NUL"
+          (do (conn, _) <- scriptedConnection []
+              IMAP.searchCharset conn "CHARSET UTF-8\r\nNOOP" [IMAP.SUBJECTs "Muller"])
     ]
 
 imapFlagTest =

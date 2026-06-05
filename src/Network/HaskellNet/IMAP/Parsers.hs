@@ -136,7 +136,7 @@ Parser pDone = do tag <- Parser advTag
 pFatalLine :: Parser RespDerivs ServerResponse
 pFatalLine = do string "* "
                 stringCI "BYE"
-                pRespText BYE
+                pRespText (\stat body -> BAD stat ("BYE: " ++ body))
 
 pRespCode :: Parser RespDerivs (Maybe StatusCode -> String -> ServerResponse)
 pRespCode = choice [ stringCI "OK" >> return OK
@@ -198,7 +198,7 @@ pStatusCode =
     where parenWords = between (space >> char '(') (char ')')
                          (many1 (noneOf " )") `sepBy1` space)
           pUID = many1 digit >>= return . read
-          pUIDSet = many1 (digit <|> char ':' <|> char ',')
+          pUIDSet = many1 (digit <|> char ':' <|> char ',' <|> char '*')
 
 pFlag :: Parser RespDerivs Flag
 pFlag = do char '\\'

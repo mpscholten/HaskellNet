@@ -111,7 +111,6 @@ data ServerResponse = OK (Maybe StatusCode) String
                     | NO (Maybe StatusCode) String
                     | BAD (Maybe StatusCode) String
                     | PREAUTH (Maybe StatusCode) String
-                    | BYE (Maybe StatusCode) String
                       deriving (Eq, Show)
 
 

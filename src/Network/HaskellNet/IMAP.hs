@@ -11,7 +11,8 @@ module Network.HaskellNet.IMAP
     , list, lsub, status, append, appendFull, appendFullUID
       -- ** selected state commands
     , check, close, expunge
-    , search, store, copy, copyUID, copyUIDs, copyUIDR, uidExpunge, uidExpungeR, move
+    , search, searchCharset, store, copy, copyUID, copyUIDs, copyUIDR, copyUIDSet
+    , uidExpunge, uidExpungeR, uidExpungeSet, move
     , idle
       -- * fetch commands
     , fetch, fetchHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
@@ -190,7 +191,6 @@ sendCommandWithResponse imapc cmdstr pFunc =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
-         BYE _ msg     -> fail ("BYE: " ++ msg)
 
 getResponse :: BSStream -> IO ByteString
 getResponse s = unlinesCRLF <$> getLs
@@ -263,7 +263,6 @@ idle conn timeout =
          NO _ msg -> fail ("NO: " ++ msg)
          BAD _ msg -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
-         BYE _ msg -> fail ("BYE: " ++ msg)
 
 noop :: IMAPConnection -> IO ()
 noop conn = sendCommand conn "NOOP" pNone
@@ -276,8 +275,11 @@ logout c = do bsPutCrLf (stream c) $ BS.pack "a0001 LOGOUT"
               bsClose (stream c)
 
 login :: IMAPConnection -> A.UserName -> A.Password -> IO ()
-login conn username password = sendCommand conn ("LOGIN " ++ (escapeLogin username) ++ " " ++ (escapeLogin password))
-                               pNone
+login conn username password =
+    do validateCommandText "login username" username
+       validateCommandText "login password" password
+       sendCommand conn ("LOGIN " ++ (escapeLogin username) ++ " " ++ (escapeLogin password))
+                   pNone
 
 authenticate :: IMAPConnection -> A.AuthType
              -> A.UserName -> A.Password -> IO ()
@@ -294,7 +296,6 @@ authenticate conn A.LOGIN username password =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
-         BYE _ msg     -> fail ("BYE: " ++ msg)
     where (userB64, passB64) = A.login username password
 authenticate conn at username password =
     do (c, num) <- sendCommand' conn $ "AUTHENTICATE " ++ show at
@@ -312,7 +313,6 @@ authenticate conn at username password =
          NO _ msg      -> fail ("NO: " ++ msg)
          BAD _ msg     -> fail ("BAD: " ++ msg)
          PREAUTH _ msg -> fail ("preauth: " ++ msg)
-         BYE _ msg     -> fail ("BYE: " ++ msg)
 
 getAuthResponse :: IMAPConnection -> IO ByteString
 getAuthResponse conn = do
@@ -323,7 +323,8 @@ getAuthResponse conn = do
 
 _select :: String -> IMAPConnection -> String -> IO ()
 _select cmd conn mboxName =
-    do mbox' <- sendCommand conn (cmd ++ quoteMailboxName mboxName) pSelect
+    do validateCommandText "mailbox name" mboxName
+       mbox' <- sendCommand conn (cmd ++ quoteMailboxName mboxName) pSelect
        setMailboxInfo conn $ mbox' { _mailbox = mboxName }
 
 select :: IMAPConnection -> MailboxName -> IO ()
@@ -333,20 +334,30 @@ examine :: IMAPConnection -> MailboxName -> IO ()
 examine = _select "EXAMINE "
 
 create :: IMAPConnection -> MailboxName -> IO ()
-create conn mboxname = sendCommand conn ("CREATE " ++ quoteMailboxName mboxname) pNone
+create conn mboxname =
+    do validateCommandText "mailbox name" mboxname
+       sendCommand conn ("CREATE " ++ quoteMailboxName mboxname) pNone
 
 delete :: IMAPConnection -> MailboxName -> IO ()
-delete conn mboxname = sendCommand conn ("DELETE " ++ quoteMailboxName mboxname) pNone
+delete conn mboxname =
+    do validateCommandText "mailbox name" mboxname
+       sendCommand conn ("DELETE " ++ quoteMailboxName mboxname) pNone
 
 rename :: IMAPConnection -> MailboxName -> MailboxName -> IO ()
 rename conn mboxorg mboxnew =
-    sendCommand conn ("RENAME " ++ quoteMailboxName mboxorg ++ " " ++ quoteMailboxName mboxnew) pNone
+    do validateCommandText "mailbox name" mboxorg
+       validateCommandText "mailbox name" mboxnew
+       sendCommand conn ("RENAME " ++ quoteMailboxName mboxorg ++ " " ++ quoteMailboxName mboxnew) pNone
 
 subscribe :: IMAPConnection -> MailboxName -> IO ()
-subscribe conn mboxname = sendCommand conn ("SUBSCRIBE " ++ quoteMailboxName mboxname) pNone
+subscribe conn mboxname =
+    do validateCommandText "mailbox name" mboxname
+       sendCommand conn ("SUBSCRIBE " ++ quoteMailboxName mboxname) pNone
 
 unsubscribe :: IMAPConnection -> MailboxName -> IO ()
-unsubscribe conn mboxname = sendCommand conn ("UNSUBSCRIBE " ++ quoteMailboxName mboxname) pNone
+unsubscribe conn mboxname =
+    do validateCommandText "mailbox name" mboxname
+       sendCommand conn ("UNSUBSCRIBE " ++ quoteMailboxName mboxname) pNone
 
 list :: IMAPConnection -> IO [([Attribute], MailboxName)]
 list conn = (map (\(a, _, m) -> (a, m))) <$> listFull conn "\"\"" "*"
@@ -365,8 +376,9 @@ lsubFull conn ref pat = sendCommand conn (unwords ["LSUB", ref, pat]) pLsub
 status :: IMAPConnection -> MailboxName -> [MailboxStatus]
        -> IO [(MailboxStatus, Integer)]
 status conn mbox stats =
-    let cmd = "STATUS " ++ quoteMailboxName mbox ++ " (" ++ (unwords $ map show stats) ++ ")"
-    in sendCommand conn cmd pStatus
+    do validateCommandText "mailbox name" mbox
+       let cmd = "STATUS " ++ quoteMailboxName mbox ++ " (" ++ (unwords $ map show stats) ++ ")"
+       sendCommand conn cmd pStatus
 
 append :: IMAPConnection -> MailboxName -> ByteString -> IO ()
 append conn mbox mailData = appendFull conn mbox mailData Nothing Nothing
@@ -379,7 +391,9 @@ appendFull conn mbox mailData flags' time =
 appendFullUID :: IMAPConnection -> MailboxName -> ByteString
               -> Maybe [Flag] -> Maybe CalendarTime -> IO (Maybe AppendUID)
 appendFullUID conn mbox mailData flags' time =
-    do (buf, num) <- sendCommand' conn
+    do validateCommandText "mailbox name" mbox
+       maybe (return ()) validateFlags flags'
+       (buf, num) <- sendCommand' conn
                 (concat ["APPEND ", quoteMailboxName mbox
                         , fstr, tstr, " {" ++ show len ++ "}"])
        when (BS.null buf || (BS.head buf /= '+')) $
@@ -394,7 +408,6 @@ appendFullUID conn mbox mailData flags' time =
          NO _ msg      -> fail ("NO: "++msg)
          BAD _ msg     -> fail ("BAD: "++msg)
          PREAUTH _ msg -> fail ("PREAUTH: "++msg)
-         BYE _ msg     -> fail ("BYE: "++msg)
     where len       = BS.length mailData
           tstr      = maybe "" ((" "++) . datetimeToStringIMAP) time
           fstr      = maybe "" ((" ("++) . (++")") . unwords . map show) flags'
@@ -413,16 +426,22 @@ expunge :: IMAPConnection -> IO [Integer]
 expunge conn = sendCommand conn "EXPUNGE" pExpunge
 
 search :: IMAPConnection -> [SearchQuery] -> IO [UID]
-search conn queries = searchCharset conn "" queries
+search conn queries =
+    let charset = if any searchQueryNeedsUtf8 queries
+                  then "CHARSET UTF-8"
+                  else ""
+    in searchCharset conn charset queries
 
 searchCharset :: IMAPConnection -> Charset -> [SearchQuery]
               -> IO [UID]
 searchCharset conn charset queries =
-    sendCommand conn ("UID SEARCH "
-                    ++ (if not . null $ charset
-                           then charset ++ " "
-                           else "")
-                    ++ unwords (map show queries)) pSearch
+    do validateCommandText "search charset" charset
+       mapM_ validateSearchQuery queries
+       sendCommand conn ("UID SEARCH "
+                       ++ (if not . null $ charset
+                              then charset ++ " "
+                              else "")
+                       ++ unwords (map show queries)) pSearch
 
 fetch :: IMAPConnection -> UID -> IO ByteString
 fetch conn uid =
@@ -448,14 +467,16 @@ fetchSize conn uid =
 fetchHeaderFields :: IMAPConnection
                   -> UID -> [String] -> IO ByteString
 fetchHeaderFields conn uid hs =
-    do let fetchCmd = "BODY[HEADER.FIELDS ("++unwords hs++")]"
+    do mapM_ (validateCommandText "fetch header field") hs
+       let fetchCmd = "BODY[HEADER.FIELDS ("++unwords hs++")]"
        lst <- fetchByString conn uid fetchCmd
        return $ maybe BS.empty BS.pack $ lookup' fetchCmd lst
 
 fetchHeaderFieldsNot :: IMAPConnection
                      -> UID -> [String] -> IO ByteString
 fetchHeaderFieldsNot conn uid hs =
-    do let fetchCmd = "BODY[HEADER.FIELDS.NOT ("++unwords hs++")]"
+    do mapM_ (validateCommandText "fetch header field") hs
+       let fetchCmd = "BODY[HEADER.FIELDS.NOT ("++unwords hs++")]"
        lst <- fetchByString conn uid fetchCmd
        return $ maybe BS.empty BS.pack $ lookup' fetchCmd lst
 
@@ -482,7 +503,8 @@ fetchRPeek conn range =
 fetchByString :: IMAPConnection -> UID -> String
               -> IO [(String, String)]
 fetchByString conn uid command =
-    do lst <- fetchCommand conn ("UID FETCH "++show uid++" "++command) id
+    do validateCommandText "fetch command" command
+       lst <- fetchCommand conn ("UID FETCH "++show uid++" "++command) id
        case lst of
          (_, pairs):_ -> return pairs
          [] -> return []
@@ -490,7 +512,8 @@ fetchByString conn uid command =
 fetchByStringR :: IMAPConnection -> (UID, UID) -> String
                -> IO [(UID, [(String, String)])]
 fetchByStringR conn (s, e) command =
-    fetchCommand conn ("UID FETCH "++show s++":"++show e++" "++command) proc
+    do validateCommandText "fetch command" command
+       fetchCommand conn ("UID FETCH "++show s++":"++show e++" "++command) proc
     where proc (n, ps) =
               (maybe (toEnum (fromIntegral n)) read (lookup' "UID" ps), ps)
 
@@ -502,7 +525,8 @@ fetchCommand conn command proc =
 storeFull :: IMAPConnection -> String -> FlagsQuery -> Bool
           -> IO [(UID, [Flag])]
 storeFull conn uidstr query isSilent =
-    fetchCommand conn ("UID STORE " ++ uidstr ++ " " ++ flgs query) procStore
+    do validateFlagsQuery query
+       fetchCommand conn ("UID STORE " ++ uidstr ++ " " ++ flgs query) procStore
     where flagList fs = "(" ++ (concat $ intersperse " " $ map show fs) ++ ")"
           labelList ls = "(" ++ (concat $ intersperse " " $ map quoteIMAPString ls) ++ ")"
           toFStr s fstrs' =
@@ -526,7 +550,8 @@ copyFull conn uidStr mbox = copyUIDFull conn uidStr mbox >> return ()
 
 copyUIDFull :: IMAPConnection -> String -> String -> IO (Maybe CopyUID)
 copyUIDFull conn uidStr mbox =
-    do (resp, ()) <- sendCommandWithResponse conn ("UID COPY " ++ uidStr ++ " " ++ quoteMailboxName mbox) pNone
+    do validateCommandText "mailbox name" mbox
+       (resp, ()) <- sendCommandWithResponse conn ("UID COPY " ++ uidStr ++ " " ++ quoteMailboxName mbox) pNone
        return $ copyUIDFromResponse resp
   where
     copyUIDFromResponse (OK (Just (COPYUID_sc copyUID')) _) = Just copyUID'
@@ -536,27 +561,39 @@ copy :: IMAPConnection -> UID -> MailboxName -> IO ()
 copy conn uid mbox     = copyFull conn (show uid) mbox
 
 copyUID :: IMAPConnection -> UID -> MailboxName -> IO (Maybe CopyUID)
-copyUID conn uid mbox = copyUIDFull conn (show uid) mbox
+copyUID conn uid mbox = copyUIDSet conn (show uid) mbox
 
 copyUIDs :: IMAPConnection -> [UID] -> MailboxName -> IO (Maybe CopyUID)
 copyUIDs _ [] _ = fail "copyUIDs: empty UID set"
-copyUIDs conn uids mbox = copyUIDFull conn (showUIDList uids) mbox
+copyUIDs conn uids mbox = copyUIDSet conn (showUIDList uids) mbox
 
 copyUIDR :: IMAPConnection -> (UID, UID) -> MailboxName -> IO (Maybe CopyUID)
-copyUIDR conn range mbox = copyUIDFull conn (showUIDRange range) mbox
+copyUIDR conn range mbox = copyUIDSet conn (showUIDRange range) mbox
+
+copyUIDSet :: IMAPConnection -> UIDSet -> MailboxName -> IO (Maybe CopyUID)
+copyUIDSet conn uidSet mbox =
+    do validateUIDSet uidSet
+       copyUIDFull conn uidSet mbox
 
 uidExpunge :: IMAPConnection -> [UID] -> IO [Integer]
 uidExpunge _ [] = fail "uidExpunge: empty UID set"
-uidExpunge conn uids = uidExpungeBySet conn $ showUIDList uids
+uidExpunge conn uids = uidExpungeSet conn $ showUIDList uids
 
 uidExpungeR :: IMAPConnection -> (UID, UID) -> IO [Integer]
-uidExpungeR conn range = uidExpungeBySet conn $ showUIDRange range
+uidExpungeR conn range = uidExpungeSet conn $ showUIDRange range
+
+uidExpungeSet :: IMAPConnection -> UIDSet -> IO [Integer]
+uidExpungeSet conn uidSet =
+    do validateUIDSet uidSet
+       uidExpungeBySet conn uidSet
 
 uidExpungeBySet :: IMAPConnection -> UIDSet -> IO [Integer]
 uidExpungeBySet conn uidSet = sendCommand conn ("UID EXPUNGE " ++ uidSet) pExpunge
 
 move :: IMAPConnection -> UID -> MailboxName -> IO ()
-move conn uid mboxname = sendCommand conn ("UID MOVE " ++ show uid ++ " " ++ quoteMailboxName mboxname) pNone
+move conn uid mboxname =
+    do validateCommandText "mailbox name" mboxname
+       sendCommand conn ("UID MOVE " ++ show uid ++ " " ++ quoteMailboxName mboxname) pNone
 
 ----------------------------------------------------------------------
 -- auxialiary functions
@@ -566,13 +603,77 @@ quoteMailboxName = quoteIMAPString . encodeMailboxName
 
 quoteIMAPString :: String -> String
 quoteIMAPString s = "\"" ++ concatMap escapeChar s ++ "\""
-    where escapeChar c
-              | isIllegalQuotedStringChar c =
-                  error "quoteIMAPString: IMAP quoted string contains illegal control character"
-          escapeChar '"' = "\\\""
+    where escapeChar '"' = "\\\""
           escapeChar '\\' = "\\\\"
           escapeChar c = [c]
-          isIllegalQuotedStringChar c = isControl c || c == '\DEL'
+
+validateCommandText :: String -> String -> IO ()
+validateCommandText label value =
+    when (any isCommandBreakingChar value) $
+         fail (label ++ " contains CR, LF, or NUL")
+
+isCommandBreakingChar :: Char -> Bool
+isCommandBreakingChar c = c == '\r' || c == '\n' || c == '\0'
+
+validateSearchQuery :: SearchQuery -> IO ()
+validateSearchQuery (BCCs s)       = validateCommandText "search BCC" s
+validateSearchQuery (BODYs s)      = validateCommandText "search BODY" s
+validateSearchQuery (CCs s)        = validateCommandText "search CC" s
+validateSearchQuery (FLAG f)       = validateFlag f
+validateSearchQuery (FROMs s)      = validateCommandText "search FROM" s
+validateSearchQuery (HEADERs f v)  = validateCommandText "search HEADER field" f >>
+                                     validateCommandText "search HEADER value" v
+validateSearchQuery (NOTs q)       = validateSearchQuery q
+validateSearchQuery (ORs q1 q2)    = validateSearchQuery q1 >> validateSearchQuery q2
+validateSearchQuery (SUBJECTs s)   = validateCommandText "search SUBJECT" s
+validateSearchQuery (TEXTs s)      = validateCommandText "search TEXT" s
+validateSearchQuery (TOs s)        = validateCommandText "search TO" s
+validateSearchQuery (UNFLAG f)     = validateFlag f
+validateSearchQuery (XGMRAW s)     = validateCommandText "search X-GM-RAW" s
+validateSearchQuery _              = return ()
+
+searchQueryNeedsUtf8 :: SearchQuery -> Bool
+searchQueryNeedsUtf8 (BCCs s)       = containsNonAscii s
+searchQueryNeedsUtf8 (BODYs s)      = containsNonAscii s
+searchQueryNeedsUtf8 (CCs s)        = containsNonAscii s
+searchQueryNeedsUtf8 (FROMs s)      = containsNonAscii s
+searchQueryNeedsUtf8 (HEADERs f v)  = containsNonAscii f || containsNonAscii v
+searchQueryNeedsUtf8 (NOTs q)       = searchQueryNeedsUtf8 q
+searchQueryNeedsUtf8 (ORs q1 q2)    = searchQueryNeedsUtf8 q1 || searchQueryNeedsUtf8 q2
+searchQueryNeedsUtf8 (SUBJECTs s)   = containsNonAscii s
+searchQueryNeedsUtf8 (TEXTs s)      = containsNonAscii s
+searchQueryNeedsUtf8 (TOs s)        = containsNonAscii s
+searchQueryNeedsUtf8 (XGMRAW s)     = containsNonAscii s
+searchQueryNeedsUtf8 _              = False
+
+containsNonAscii :: String -> Bool
+containsNonAscii = any ((> 0x7f) . ord)
+
+validateFlagsQuery :: FlagsQuery -> IO ()
+validateFlagsQuery (ReplaceFlags fs)            = validateFlags fs
+validateFlagsQuery (PlusFlags fs)               = validateFlags fs
+validateFlagsQuery (MinusFlags fs)              = validateFlags fs
+validateFlagsQuery (ReplaceGmailLabels labels) = validateGmailLabels labels
+validateFlagsQuery (PlusGmailLabels labels)    = validateGmailLabels labels
+validateFlagsQuery (MinusGmailLabels labels)   = validateGmailLabels labels
+
+validateFlags :: [Flag] -> IO ()
+validateFlags = mapM_ validateFlag
+
+validateFlag :: Flag -> IO ()
+validateFlag (Keyword keyword) = validateCommandText "flag keyword" keyword
+validateFlag _                 = return ()
+
+validateGmailLabels :: [GmailLabel] -> IO ()
+validateGmailLabels = mapM_ (validateCommandText "Gmail label")
+
+validateUIDSet :: UIDSet -> IO ()
+validateUIDSet [] = fail "UID set must not be empty"
+validateUIDSet uidSet =
+    unless (all isUIDSetChar uidSet) $
+           fail "UID set contains invalid characters"
+  where
+    isUIDSetChar c = isDigit c || c == ':' || c == ',' || c == '*'
 
 showMonth :: Month -> String
 showMonth January   = "Jan"
