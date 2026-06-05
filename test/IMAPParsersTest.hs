@@ -1,11 +1,61 @@
 module Main (main) where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as BS
+import Data.IORef
+import Network.HaskellNet.BSStream
+import qualified Network.HaskellNet.IMAP as IMAP
+import Network.HaskellNet.IMAP.Connection
 import Network.HaskellNet.IMAP.Parsers
 import Network.HaskellNet.IMAP.Types
 
 import System.Exit
 
 import Test.HUnit
+
+data ReadStep = ReadLine ByteString | ReadBytes ByteString
+
+scriptedStream :: [ReadStep] -> IO BSStream
+scriptedStream steps = do
+    input <- newIORef steps
+    return BSStream
+        { bsGetLine = popLine input
+        , bsGet = popBytes input
+        , bsPut = \_ -> return ()
+        , bsFlush = return ()
+        , bsClose = return ()
+        , bsIsOpen = return True
+        , bsWaitForInput = \_ -> return False
+        }
+  where
+    popLine input = do
+        steps' <- readIORef input
+        case steps' of
+            ReadLine line : rest -> writeIORef input rest >> return line
+            ReadBytes _ : _ -> assertFailure "expected test stream line, got bytes"
+            [] -> assertFailure "test stream exhausted while reading a line"
+
+    popBytes input n = do
+        steps' <- readIORef input
+        case steps' of
+            ReadBytes bytes : rest ->
+                let (chunk, remainder) = BS.splitAt n bytes
+                    next = if BS.null remainder then rest else ReadBytes remainder : rest
+                in writeIORef input next >> return chunk
+            ReadLine _ : _ -> assertFailure "expected test stream bytes, got a line"
+            [] -> assertFailure "test stream exhausted while reading bytes"
+
+scriptedConnection :: [ReadStep] -> IO IMAPConnection
+scriptedConnection steps = do
+    testStream <- scriptedStream steps
+    newConnection testStream
+
+line :: String -> ReadStep
+line = ReadLine . BS.pack
+
+okLine :: String -> ReadStep
+okLine = line . ("000000 OK " ++)
 
 baseTest =
     [(OK Nothing "LOGIN Completed", MboxUpdate Nothing Nothing, ())
@@ -197,6 +247,28 @@ flagTest =
           [Keyword "\\Custom"] ~=? eval' dvFlags "" "(\\Custom)"
     ]
 
+imapFetchTest =
+    [ "fetchByByteString preserves raw literal bytes" ~: TestCase $ do
+          let body = B.pack [0, 10, 255, 65]
+          conn <- scriptedConnection
+              [ line "* 12 FETCH (BODY[] {4}"
+              , ReadBytes body
+              , line " UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchByByteString conn 42 "BODY[]"
+          [("BODY[]", body), ("UID", BS.pack "42")] @=? fetched
+    , "fetch preserves large literals" ~: TestCase $ do
+          let body = BS.replicate (1024 * 1024) 'x'
+          conn <- scriptedConnection
+              [ line ("* 12 FETCH (BODY[] {" ++ show (BS.length body) ++ "}")
+              , ReadBytes body
+              , line " UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetch conn 42
+          body @=? fetched
+    ]
 
 testData = [ "base" ~: baseTest
            , "capability" ~: capabilityTest
@@ -208,6 +280,7 @@ testData = [ "base" ~: baseTest
            , "search" ~: searchTest
            , "fetch" ~: fetchTest
            , "flags" ~: flagTest
+           , "imap fetch api" ~: imapFetchTest
            ]
 
 
