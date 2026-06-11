@@ -17,6 +17,7 @@ module Network.HaskellNet.IMAP
       -- * fetch commands
     , fetch, fetchHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
     , fetchFlags, fetchR, fetchByString, fetchByStringR
+    , fetchByByteString, fetchByByteStringR
     , fetchPeek, fetchRPeek
       -- * other types
     , Flag(..), Attribute(..), MailboxStatus(..)
@@ -157,11 +158,16 @@ connectStream s =
 -- normal send commands
 sendCommand' :: IMAPConnection -> String -> IO (ByteString, Int)
 sendCommand' c cmdstr = do
+  num <- sendCommandNoResponse c cmdstr
+  resp <- getResponse (stream c)
+  return (resp, num)
+
+sendCommandNoResponse :: IMAPConnection -> String -> IO Int
+sendCommandNoResponse c cmdstr = do
   (_, num) <- withNextCommandNum c $ \num -> do
               let bytes = encodeUtf8 $ show6 num ++ " " ++ cmdstr
               BS.length bytes `seq` bsPutCrLf (stream c) bytes
-  resp <- getResponse (stream c)
-  return (resp, num)
+  return num
 
 encodeUtf8 :: String -> ByteString
 encodeUtf8 = TextEncoding.encodeUtf8 . Text.pack
@@ -443,84 +449,390 @@ searchCharset conn charset queries =
                               else "")
                        ++ unwords (map show queries)) pSearch
 
+-- | An untagged NIL means "no data" (RFC 3501); normalize it to an empty
+-- body so callers don't see the literal atom. Real bodies arrive as IMAP
+-- literals and are never the bare atom NIL.
+nilToEmpty :: ByteString -> ByteString
+nilToEmpty bs = if bs == BS.pack "NIL" then BS.empty else bs
+
 fetch :: IMAPConnection -> UID -> IO ByteString
 fetch conn uid =
-    do lst <- fetchByString conn uid "BODY[]"
-       return $ maybe BS.empty BS.pack $ lookup' "BODY[]" lst
+    do lst <- fetchByByteString conn uid "BODY[]"
+       return $ nilToEmpty $ fromMaybe BS.empty $ lookup' "BODY[]" lst
 
 -- | Like 'fetch' but without marking the email as seen/read
 fetchPeek :: IMAPConnection -> UID -> IO ByteString
 fetchPeek conn uid =
-    do lst <- fetchByString conn uid "BODY.PEEK[]"
-       return $ maybe BS.empty BS.pack $ lookup' "BODY[]" lst
+    do lst <- fetchByByteString conn uid "BODY.PEEK[]"
+       return $ nilToEmpty $ fromMaybe BS.empty $ lookup' "BODY[]" lst
 
 fetchHeader :: IMAPConnection -> UID -> IO ByteString
 fetchHeader conn uid =
-    do lst <- fetchByString conn uid "BODY[HEADER]"
-       return $ maybe BS.empty BS.pack $ lookup' "BODY[HEADER]" lst
+    do lst <- fetchByByteString conn uid "BODY[HEADER]"
+       return $ fromMaybe BS.empty $ lookup' "BODY[HEADER]" lst
 
 fetchSize :: IMAPConnection -> UID -> IO Int
 fetchSize conn uid =
-    do lst <- fetchByString conn uid "RFC822.SIZE"
-       return $ maybe 0 read $ lookup "RFC822.SIZE" lst
+    do lst <- fetchByByteString conn uid "RFC822.SIZE"
+       return $ maybe 0 (read . BS.unpack) $ lookup "RFC822.SIZE" lst
 
 fetchHeaderFields :: IMAPConnection
                   -> UID -> [String] -> IO ByteString
 fetchHeaderFields conn uid hs =
     do mapM_ (validateCommandText "fetch header field") hs
        let fetchCmd = "BODY[HEADER.FIELDS ("++unwords hs++")]"
-       lst <- fetchByString conn uid fetchCmd
-       return $ maybe BS.empty BS.pack $ lookup' fetchCmd lst
+       lst <- fetchByByteString conn uid fetchCmd
+       return $ fromMaybe BS.empty $ lookup' fetchCmd lst
 
 fetchHeaderFieldsNot :: IMAPConnection
                      -> UID -> [String] -> IO ByteString
 fetchHeaderFieldsNot conn uid hs =
     do mapM_ (validateCommandText "fetch header field") hs
        let fetchCmd = "BODY[HEADER.FIELDS.NOT ("++unwords hs++")]"
-       lst <- fetchByString conn uid fetchCmd
-       return $ maybe BS.empty BS.pack $ lookup' fetchCmd lst
+       lst <- fetchByByteString conn uid fetchCmd
+       return $ fromMaybe BS.empty $ lookup' fetchCmd lst
 
 fetchFlags :: IMAPConnection -> UID -> IO [Flag]
 fetchFlags conn uid =
-    do lst <- fetchByString conn uid "FLAGS"
+    do lst <- fetchByByteString conn uid "FLAGS"
        return $ getFlags $ lookup "FLAGS" lst
     where getFlags Nothing  = []
-          getFlags (Just s) = eval' dvFlags "" s
+          getFlags (Just s) = eval' dvFlags "" (BS.unpack s)
 
 fetchR :: IMAPConnection -> (UID, UID)
        -> IO [(UID, ByteString)]
 fetchR conn r =
-    do lst <- fetchByStringR conn r "BODY[]"
-       return $ map (\(uid, vs) -> (uid, maybe BS.empty BS.pack $
+    do lst <- fetchByByteStringR conn r "BODY[]"
+       return $ map (\(uid, vs) -> (uid, nilToEmpty $ fromMaybe BS.empty $
                                        lookup' "BODY[]" vs)) lst
 
 -- | Like 'fetchR' but without marking the email as seen/read
 fetchRPeek :: IMAPConnection -> (UID, UID) -> IO [(UID, ByteString)]
 fetchRPeek conn range =
-    do ls <- fetchByStringR conn range "BODY.PEEK[]"
-       return $ map (\(uid, vs) -> (uid, maybe BS.empty BS.pack $ lookup' "BODY[]" vs)) ls
+    do ls <- fetchByByteStringR conn range "BODY.PEEK[]"
+       return $ map (\(uid, vs) -> (uid, nilToEmpty $ fromMaybe BS.empty $ lookup' "BODY[]" vs)) ls
 
+-- | Fetch arbitrary data items and return values as 'String's.
+--
+-- This is kept for compatibility. Prefer 'fetchByByteString' for message
+-- bodies or other data that may be large or non-textual.
 fetchByString :: IMAPConnection -> UID -> String
               -> IO [(String, String)]
 fetchByString conn uid command =
+    map (\(key, value) -> (key, BS.unpack value)) <$> fetchByByteString conn uid command
+
+-- | Fetch arbitrary data items and return raw 'ByteString' values.
+--
+-- Literal values are read directly from the stream instead of first building a
+-- full response buffer, so this is the preferred API for large messages.
+fetchByByteString :: IMAPConnection -> UID -> String
+                  -> IO [(String, ByteString)]
+fetchByByteString conn uid command =
     do validateCommandText "fetch command" command
-       lst <- fetchCommand conn ("UID FETCH "++show uid++" "++command) id
+       lst <- fetchCommandBS conn ("UID FETCH "++show uid++" "++command) id
        case lst of
          (_, pairs):_ -> return pairs
          [] -> return []
 
+-- | Range variant of 'fetchByString'.
 fetchByStringR :: IMAPConnection -> (UID, UID) -> String
                -> IO [(UID, [(String, String)])]
 fetchByStringR conn (s, e) command =
+    map unpackFetch <$> fetchByByteStringR conn (s, e) command
+    where unpackFetch (uid, pairs) =
+              (uid, map (\(key, value) -> (key, BS.unpack value)) pairs)
+
+-- | Range variant of 'fetchByByteString'.
+fetchByByteStringR :: IMAPConnection -> (UID, UID) -> String
+                   -> IO [(UID, [(String, ByteString)])]
+fetchByByteStringR conn (s, e) command =
     do validateCommandText "fetch command" command
-       fetchCommand conn ("UID FETCH "++show s++":"++show e++" "++command) proc
+       fetchCommandBS conn ("UID FETCH "++show s++":"++show e++" "++command) proc
     where proc (n, ps) =
-              (maybe (toEnum (fromIntegral n)) read (lookup' "UID" ps), ps)
+              (maybe (toEnum (fromIntegral n)) (read . BS.unpack) (lookup' "UID" ps), ps)
 
 fetchCommand :: IMAPConnection -> String
              -> ((Integer, [(String, String)]) -> b) -> IO [b]
 fetchCommand conn command proc =
-    (map proc) <$> sendCommand conn command pFetch
+    fetchCommandBS conn command $ \(n, ps) ->
+        proc (n, map (\(key, value) -> (key, BS.unpack value)) ps)
+
+fetchCommandBS :: IMAPConnection -> String
+               -> ((Integer, [(String, ByteString)]) -> b) -> IO [b]
+fetchCommandBS conn command proc =
+    do num <- sendCommandNoResponse conn command
+       (resp, mboxUp, values) <- getFetchResponseBS (stream conn) (show6 num)
+       case resp of
+         OK _ _        -> do mboxUpdate conn mboxUp
+                             return $ map proc values
+         NO _ msg      -> fail ("NO: " ++ msg)
+         BAD _ msg     -> fail ("BAD: " ++ msg)
+         PREAUTH _ msg -> fail ("preauth: " ++ msg)
+
+-- Streaming FETCH response parser. Literal payloads are read with 'bsGet' so
+-- large message bodies do not require buffering the complete server response.
+getFetchResponseBS :: BSStream -> String
+                   -> IO (ServerResponse, MboxUpdate, [(Integer, [(String, ByteString)])])
+getFetchResponseBS s tag = go Nothing Nothing []
+  where
+    go exists' recent' fetches = do
+        line <- strip <$> bsGetLine s
+        case parseTaggedOrFatalLineBS tag line of
+          Just resp -> return (resp, MboxUpdate exists' recent', reverse fetches)
+          Nothing ->
+              case parseFetchLineStartBS line of
+                Just fetchInput -> do
+                    fetchLine <- parseFetchLineBS s fetchInput
+                    go exists' recent' (fetchLine:fetches)
+                Nothing ->
+                    case parseNumberedUpdateLineBS "EXISTS" line of
+                      Just n -> go (Just n) recent' fetches
+                      Nothing ->
+                          case parseNumberedUpdateLineBS "RECENT" line of
+                            Just n -> go exists' (Just n) fetches
+                            Nothing -> do
+                                skipLineLiteralsBS s line
+                                go exists' recent' fetches
+
+parseTaggedOrFatalLineBS :: String -> ByteString -> Maybe ServerResponse
+parseTaggedOrFatalLineBS tag line =
+    if isTaggedLine line || isFatalLine line
+       then let (resp, _, ()) = eval pNone tag (BS.append line crlf)
+            in Just resp
+       else Nothing
+  where
+    isTaggedLine = BS.isPrefixOf (BS.pack $ tag ++ " ")
+    isFatalLine input =
+        case stripPrefixBS (BS.pack "* ") input of
+          Just rest -> startsWithCIBS (BS.pack "BYE") rest
+          Nothing -> False
+
+parseFetchLineStartBS :: ByteString -> Maybe (Integer, ByteString)
+parseFetchLineStartBS input =
+    do rest1 <- stripPrefixBS (BS.pack "* ") input
+       (numBytes, rest2) <- span1BS isDigit rest1
+       rest3 <- stripSpaces1BS rest2
+       rest4 <- stripPrefixCIBS (BS.pack "FETCH") rest3
+       rest5 <- stripCharBS '(' $ dropSpacesBS rest4
+       return (read $ BS.unpack numBytes, rest5)
+
+parseFetchLineBS :: BSStream -> (Integer, ByteString)
+                 -> IO (Integer, [(String, ByteString)])
+parseFetchLineBS s (num, input) =
+    do pairs <- parseFetchPairsBS s [] input
+       return (num, pairs)
+
+parseFetchPairsBS :: BSStream -> [(String, ByteString)] -> ByteString
+                  -> IO [(String, ByteString)]
+parseFetchPairsBS s pairs input =
+    case BS.uncons input of
+      Just (')', rest) | BS.null (dropSpacesBS rest) -> return $ reverse pairs
+      _ -> case parseFetchKeyBS input of
+             Just (key, rest1) -> do
+                 valueResult <- parseFetchValueBS s rest1
+                 case valueResult of
+                   Just (value, rest2) ->
+                       parseFetchPairsBS s ((key, value):pairs) $ dropSpacesBS rest2
+                   Nothing -> fetchParseError "cannot parse FETCH value" input
+             Nothing -> fetchParseError "cannot parse FETCH key" input
+
+parseFetchKeyBS :: ByteString -> Maybe (String, ByteString)
+parseFetchKeyBS input =
+    let (name, rest1) = BS.span isFetchKeyChar input
+    in if BS.null name
+       then Nothing
+       else do (section, rest2) <- parseFetchSectionBS rest1
+               rest3 <- stripSpaces1BS rest2
+               return (map toUpper (BS.unpack name) ++ BS.unpack section, rest3)
+  where
+    isFetchKeyChar c = not $ c `elem` " [)\r\n"
+
+parseFetchSectionBS :: ByteString -> Maybe (ByteString, ByteString)
+parseFetchSectionBS input =
+    case BS.uncons input of
+      Just ('[', rest1) ->
+          let (sectionBody, rest2) = BS.break (== ']') rest1
+          in case BS.uncons rest2 of
+               Just (']', rest3) ->
+                   do (origin, rest4) <- parseFetchOriginBS rest3
+                      return (BS.concat [BS.pack "[", sectionBody, BS.pack "]", origin], rest4)
+               _ -> Nothing
+      _ -> Just (BS.empty, input)
+
+parseFetchOriginBS :: ByteString -> Maybe (ByteString, ByteString)
+parseFetchOriginBS input =
+    case BS.uncons input of
+      Just ('<', rest1) ->
+          do (digits, rest2) <- span1BS isDigit rest1
+             rest3 <- stripCharBS '>' rest2
+             return (BS.concat [BS.pack "<", digits, BS.pack ">"], rest3)
+      _ -> Just (BS.empty, input)
+
+parseFetchValueBS :: BSStream -> ByteString -> IO (Maybe (ByteString, ByteString))
+parseFetchValueBS s input =
+    case BS.uncons input of
+      Just ('(', _) -> return $ parseParenValueBS input
+      Just ('{', _) -> Just <$> parseLiteralValueBS s input
+      Just ('~', rest) | BS.take 1 rest == BS.pack "{" ->
+          Just <$> parseLiteralValueBS s input
+      Just ('"', _) -> return $ parseQuotedValueBS input
+      _ -> return $ parseAtomValueBS input
+
+parseParenValueBS :: ByteString -> Maybe (ByteString, ByteString)
+parseParenValueBS input =
+    do valueLen <- scanParenValueEndBS input
+       let (value, rest) = BS.splitAt valueLen input
+       return (value, rest)
+
+parseLiteralValueBS :: BSStream -> ByteString -> IO (ByteString, ByteString)
+parseLiteralValueBS s input =
+    case parseLiteralMarkerBS input of
+      Just literalLen -> do
+          literal <- bsGet s literalLen
+          if BS.length literal /= literalLen
+             then fetchParseError "short FETCH literal" input
+             else do tailLine <- strip <$> bsGetLine s
+                     return (literal, tailLine)
+      Nothing -> fetchParseError "cannot parse FETCH literal marker" input
+
+parseLiteralMarkerBS :: ByteString -> Maybe Int
+parseLiteralMarkerBS input =
+    do rest1 <- case BS.uncons input of
+                  Just ('~', rest) -> Just rest
+                  _ -> Just input
+       rest2 <- stripCharBS '{' rest1
+       (lenBytes, rest3) <- span1BS isDigit rest2
+       let rest4 = case BS.uncons rest3 of
+                     Just ('+', rest) -> rest
+                     _ -> rest3
+       rest5 <- stripCharBS '}' rest4
+       if BS.null (dropSpacesBS rest5)
+          then Just $ read $ BS.unpack lenBytes
+          else Nothing
+
+skipLineLiteralsBS :: BSStream -> ByteString -> IO ()
+skipLineLiteralsBS s line =
+    case literalLengthAtLineEndBS line of
+      Just literalLen -> do
+          _ <- bsGet s literalLen
+          nextLine <- strip <$> bsGetLine s
+          skipLineLiteralsBS s nextLine
+      Nothing -> return ()
+
+literalLengthAtLineEndBS :: ByteString -> Maybe Int
+literalLengthAtLineEndBS line =
+    let stripped = strip line
+    in if BS.length stripped >= 3 && BS.last stripped == '}'
+       then parseLiteralTailBS $ reverse $ BS.unpack $ BS.init stripped
+       else Nothing
+  where
+    parseLiteralTailBS revBeforeClose =
+        case break (== '{') revBeforeClose of
+          (insideRev, _ : _) -> parseLiteralInsideBS $ reverse insideRev
+          _ -> Nothing
+    parseLiteralInsideBS inside =
+        let digits' = case reverse inside of
+                        '+' : rest -> reverse rest
+                        _ -> inside
+        in if not (null digits') && all isDigit digits'
+           then Just $ read digits'
+           else Nothing
+
+parseQuotedValueBS :: ByteString -> Maybe (ByteString, ByteString)
+parseQuotedValueBS input =
+    do valueLen <- scanQuotedValueEndBS 1 input
+       let (value, rest) = BS.splitAt valueLen input
+       return (value, rest)
+
+parseAtomValueBS :: ByteString -> Maybe (ByteString, ByteString)
+parseAtomValueBS input =
+    let (value, rest) = BS.span isAtomValueChar input
+    in if BS.null value then Nothing else Just (value, rest)
+  where
+    isAtomValueChar c = not $ c `elem` " (){%*\"\\]\r\n"
+
+scanParenValueEndBS :: ByteString -> Maybe Int
+scanParenValueEndBS input =
+    case BS.uncons input of
+      Just ('(', _) -> go 0 0
+      _ -> Nothing
+  where
+    inputLen = BS.length input
+    go :: Int -> Int -> Maybe Int
+    go i depth
+        | i >= inputLen = Nothing
+        | otherwise =
+            case BS.index input i of
+              '"' -> do next <- scanQuotedValueEndBS (i + 1) input
+                        go next depth
+              '(' -> go (i + 1) (depth + 1)
+              ')' | depth == 1 -> Just (i + 1)
+                  | depth > 1 -> go (i + 1) (depth - 1)
+                  | otherwise -> Nothing
+              _ -> go (i + 1) depth
+
+scanQuotedValueEndBS :: Int -> ByteString -> Maybe Int
+scanQuotedValueEndBS = go
+  where
+    go i input
+        | i >= BS.length input = Nothing
+        | otherwise =
+            case BS.index input i of
+              '\\' -> go (i + 2) input
+              '"' -> Just (i + 1)
+              _ -> go (i + 1) input
+
+parseNumberedUpdateLineBS :: String -> ByteString -> Maybe Integer
+parseNumberedUpdateLineBS name input =
+    do rest1 <- stripPrefixBS (BS.pack "* ") input
+       (numBytes, rest2) <- span1BS isDigit rest1
+       rest3 <- stripSpaces1BS rest2
+       rest4 <- stripPrefixCIBS (BS.pack name) rest3
+       if BS.null (dropSpacesBS rest4)
+          then Just $ read $ BS.unpack numBytes
+          else Nothing
+
+stripPrefixBS :: ByteString -> ByteString -> Maybe ByteString
+stripPrefixBS prefix input =
+    if prefix `BS.isPrefixOf` input
+    then Just $ BS.drop (BS.length prefix) input
+    else Nothing
+
+stripPrefixCIBS :: ByteString -> ByteString -> Maybe ByteString
+stripPrefixCIBS prefix input =
+    if startsWithCIBS prefix input
+    then Just $ BS.drop (BS.length prefix) input
+    else Nothing
+
+startsWithCIBS :: ByteString -> ByteString -> Bool
+startsWithCIBS prefix input =
+    let prefixLen = BS.length prefix
+        candidate = BS.take prefixLen input
+    in BS.length candidate == prefixLen
+       && BS.map toUpper candidate == BS.map toUpper prefix
+
+stripCharBS :: Char -> ByteString -> Maybe ByteString
+stripCharBS expected input =
+    case BS.uncons input of
+      Just (actual, rest) | actual == expected -> Just rest
+      _ -> Nothing
+
+span1BS :: (Char -> Bool) -> ByteString -> Maybe (ByteString, ByteString)
+span1BS predicate input =
+    let result@(matching, _) = BS.span predicate input
+    in if BS.null matching then Nothing else Just result
+
+dropSpacesBS :: ByteString -> ByteString
+dropSpacesBS = BS.dropWhile (== ' ')
+
+stripSpaces1BS :: ByteString -> Maybe ByteString
+stripSpaces1BS input =
+    let rest = dropSpacesBS input
+    in if BS.length rest == BS.length input then Nothing else Just rest
+
+fetchParseError :: String -> ByteString -> a
+fetchParseError message input =
+    error $ message ++ ": " ++ show (BS.take 120 input)
 
 storeFull :: IMAPConnection -> String -> FlagsQuery -> Bool
           -> IO [(UID, [Flag])]
