@@ -325,6 +325,14 @@ imapCommandTest =
           (commandBytes "000000 UID COPY 42 \"foo bar\"")
           [okLine "COPY completed"]
           (\conn -> IMAP.copy conn 42 "foo bar")
+    , assertCommand "fetchPeekHeader uses BODY.PEEK[HEADER]"
+          (commandBytes "000000 UID FETCH 42 BODY.PEEK[HEADER]")
+          [ line "* 12 FETCH (BODY[HEADER] {4}"
+          , ReadBytes (BS.pack "head")
+          , line " UID 42)"
+          , okLine "FETCH completed"
+          ]
+          (\conn -> IMAP.fetchPeekHeader conn 42)
     , assertCommand "move quotes mailbox"
           (commandBytes "000000 UID MOVE 42 \"foo bar\"")
           [okLine "MOVE completed"]
@@ -388,6 +396,28 @@ imapFetchTest =
               ]
           fetched <- IMAP.fetchPeek conn 42
           body @=? fetched
+    , "fetchPeekHeader reads headers without setting Seen" ~: TestCase $ do
+          let headers = BS.pack "Subject: Hi\r\nFrom: a@example.com\r\n\r\n"
+          (conn, _) <- scriptedConnection
+              [ line ("* 12 FETCH (BODY[HEADER] {"
+                       ++ show (BS.length headers) ++ "}")
+              , ReadBytes headers
+              , line " UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchPeekHeader conn 42
+          headers @=? fetched
+    , "fetchPeekHeader accepts BODY.PEEK response keys" ~: TestCase $ do
+          let headers = BS.pack "Subject: Peek\r\n\r\n"
+          (conn, _) <- scriptedConnection
+              [ line ("* 12 FETCH (BODY.PEEK[HEADER] {"
+                       ++ show (BS.length headers) ++ "}")
+              , ReadBytes headers
+              , line " UID 42)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchPeekHeader conn 42
+          headers @=? fetched
     , "fetchSize parses scalar size responses" ~: TestCase $ do
           (conn, _) <- scriptedConnection
               [ line "* 12 FETCH (RFC822.SIZE 12345 UID 42)"
