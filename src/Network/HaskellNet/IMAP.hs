@@ -586,18 +586,34 @@ parseFetchOriginBS input =
 parseFetchValueBS :: BSStream -> ByteString -> IO (Maybe (ByteString, ByteString))
 parseFetchValueBS s input =
     case BS.uncons input of
-      Just ('(', _) -> return $ parseParenValueBS input
+      Just ('(', _) -> Just <$> parseParenValueBS s input
       Just ('{', _) -> Just <$> parseLiteralValueBS s input
       Just ('~', rest) | BS.take 1 rest == BS.pack "{" ->
           Just <$> parseLiteralValueBS s input
       Just ('"', _) -> return $ parseQuotedValueBS input
       _ -> return $ parseAtomValueBS input
 
-parseParenValueBS :: ByteString -> Maybe (ByteString, ByteString)
-parseParenValueBS input =
-    do valueLen <- scanParenValueEndBS input
-       let (value, rest) = BS.splitAt valueLen input
-       return (value, rest)
+-- Parenthesized FETCH values such as BODYSTRUCTURE may contain IMAP literals.
+-- A literal splits the value across lines, and its payload must not affect the
+-- surrounding parenthesis/quote scan.
+parseParenValueBS :: BSStream -> ByteString -> IO (ByteString, ByteString)
+parseParenValueBS s = go [] 0
+  where
+    go chunks initialDepth input =
+        case scanParenValueChunkBS initialDepth input of
+          ParenComplete valueLen ->
+              let (value, rest) = BS.splitAt valueLen input
+              in return (BS.concat $ reverse (value:chunks), rest)
+          ParenIncomplete nextDepth ->
+              case literalLengthAtLineEndBS input of
+                Just literalLen -> do
+                    literal <- bsGet s literalLen
+                    if BS.length literal /= literalLen
+                       then fetchParseError "short nested FETCH literal" input
+                       else do tailLine <- stripLineEndingBS <$> bsGetLine s
+                               go (literal:crlf:input:chunks) nextDepth tailLine
+                Nothing -> fetchParseError "cannot parse parenthesized FETCH value" input
+          ParenInvalid -> fetchParseError "cannot parse parenthesized FETCH value" input
 
 parseLiteralValueBS :: BSStream -> ByteString -> IO (ByteString, ByteString)
 parseLiteralValueBS s input =
@@ -666,24 +682,31 @@ parseAtomValueBS input =
   where
     isAtomValueChar c = not $ c `elem` " (){%*\"\\]\r\n"
 
-scanParenValueEndBS :: ByteString -> Maybe Int
-scanParenValueEndBS input =
-    case BS.uncons input of
-      Just ('(', _) -> go 0 0
-      _ -> Nothing
+data ParenScan
+    = ParenComplete Int
+    | ParenIncomplete Int
+    | ParenInvalid
+
+scanParenValueChunkBS :: Int -> ByteString -> ParenScan
+scanParenValueChunkBS initialDepth input =
+    if initialDepth > 0 || BS.take 1 input == BS.pack "("
+       then go 0 initialDepth
+       else ParenInvalid
   where
     inputLen = BS.length input
-    go :: Int -> Int -> Maybe Int
+    go :: Int -> Int -> ParenScan
     go i depth
-        | i >= inputLen = Nothing
+        | i >= inputLen =
+            if depth > 0 then ParenIncomplete depth else ParenInvalid
         | otherwise =
             case BS.index input i of
-              '"' -> do next <- scanQuotedValueEndBS (i + 1) input
-                        go next depth
+              '"' -> case scanQuotedValueEndBS (i + 1) input of
+                       Just next -> go next depth
+                       Nothing -> ParenInvalid
               '(' -> go (i + 1) (depth + 1)
-              ')' | depth == 1 -> Just (i + 1)
+              ')' | depth == 1 -> ParenComplete (i + 1)
                   | depth > 1 -> go (i + 1) (depth - 1)
-                  | otherwise -> Nothing
+                  | otherwise -> ParenInvalid
               _ -> go (i + 1) depth
 
 scanQuotedValueEndBS :: Int -> ByteString -> Maybe Int
@@ -744,6 +767,13 @@ stripSpaces1BS :: ByteString -> Maybe ByteString
 stripSpaces1BS input =
     let rest = dropSpacesBS input
     in if BS.length rest == BS.length input then Nothing else Just rest
+
+-- Preserve leading spaces on literal continuation lines because they delimit
+-- values inside the reconstructed parenthesized response.
+stripLineEndingBS :: ByteString -> ByteString
+stripLineEndingBS = BS.reverse . BS.dropWhile isLineEnding . BS.reverse
+  where
+    isLineEnding c = c == '\r' || c == '\n'
 
 fetchParseError :: String -> ByteString -> a
 fetchParseError message input =

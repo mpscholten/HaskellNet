@@ -365,6 +365,23 @@ imapFetchTest =
               ]
           fetched <- IMAP.fetch conn 42
           body @=? fetched
+    , "fetchByByteString accepts literals nested in BODYSTRUCTURE" ~: TestCase $ do
+          let filename = BS.pack "invoice.pdf"
+              expectedStructure = BS.concat
+                  [ BS.pack "(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" {11}\r\n"
+                  , filename
+                  , BS.pack " \"X-EXTRA\" \"value\") NIL NIL \"BASE64\" 100)"
+                  ]
+          (conn, _) <- scriptedConnection
+              [ line "* 1 FETCH (BODYSTRUCTURE (\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" {11}"
+              , ReadBytes filename
+              , line " \"X-EXTRA\" \"value\") NIL NIL \"BASE64\" 100) UID 101)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchByByteString conn 101 "BODYSTRUCTURE"
+          [ ("BODYSTRUCTURE", expectedStructure)
+            , ("UID", BS.pack "101")
+            ] @=? fetched
     , "fetch tolerates trailing UID/FLAGS after body literal (Office365/Exchange, #15)" ~: TestCase $ do
           -- Office365 and Exchange append "UID nn FLAGS (\\Seen)" after the
           -- BODY[] literal, before the closing ')'. The old Parsec parser
