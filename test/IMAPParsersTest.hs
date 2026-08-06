@@ -382,6 +382,24 @@ imapFetchTest =
           [ ("BODYSTRUCTURE", expectedStructure)
             , ("UID", BS.pack "101")
             ] @=? fetched
+    , "nested FETCH literal payload does not affect parenthesis scanning" ~: TestCase $ do
+          let literalPayload = BS.pack "invoice)(\".pdf"
+              literalLength = BS.length literalPayload
+              expectedStructure = BS.concat
+                  [ BS.pack ("(\"APPLICATION\" \"PDF\" (\"NAME\" {" ++ show literalLength ++ "}\r\n")
+                  , literalPayload
+                  , BS.pack ") NIL NIL \"BASE64\" 100)"
+                  ]
+          (conn, _) <- scriptedConnection
+              [ line ("* 2 FETCH (BODYSTRUCTURE (\"APPLICATION\" \"PDF\" (\"NAME\" {" ++ show literalLength ++ "}")
+              , ReadBytes literalPayload
+              , line ") NIL NIL \"BASE64\" 100) UID 102)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchByByteString conn 102 "BODYSTRUCTURE"
+          [ ("BODYSTRUCTURE", expectedStructure)
+            , ("UID", BS.pack "102")
+            ] @=? fetched
     , "fetch tolerates trailing UID/FLAGS after body literal (Office365/Exchange, #15)" ~: TestCase $ do
           -- Office365 and Exchange append "UID nn FLAGS (\\Seen)" after the
           -- BODY[] literal, before the closing ')'. The old Parsec parser
