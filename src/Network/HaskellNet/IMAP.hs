@@ -14,7 +14,7 @@ module Network.HaskellNet.IMAP
     , search, store, copy, move
     , idle
       -- * fetch commands
-    , fetch, fetchHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
+    , fetch, fetchHeader, fetchPeekHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
     , fetchFlags, fetchR, fetchByString, fetchByStringR
     , fetchByByteString, fetchByByteStringR
     , fetchPeek, fetchRPeek
@@ -388,6 +388,12 @@ fetchPeek conn uid =
 fetchHeader :: IMAPConnection -> UID -> IO ByteString
 fetchHeader conn uid =
     do lst <- fetchByByteString conn uid "BODY[HEADER]"
+       return $ fromMaybe BS.empty $ lookup' "BODY[HEADER]" lst
+
+-- | Like 'fetchHeader' but without marking the email as seen/read.
+fetchPeekHeader :: IMAPConnection -> UID -> IO ByteString
+fetchPeekHeader conn uid =
+    do lst <- fetchByByteString conn uid "BODY.PEEK[HEADER]"
        return $ fromMaybe BS.empty $ lookup' "BODY[HEADER]" lst
 
 fetchSize :: IMAPConnection -> UID -> IO Int
