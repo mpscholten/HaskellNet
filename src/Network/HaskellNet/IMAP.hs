@@ -16,7 +16,7 @@ module Network.HaskellNet.IMAP
       -- * fetch commands
     , fetch, fetchHeader, fetchPeekHeader, fetchSize, fetchHeaderFields, fetchHeaderFieldsNot
     , fetchFlags, fetchR, fetchByString, fetchByStringR
-    , fetchByByteString, fetchByByteStringR
+    , fetchByByteString, fetchByByteStringR, fetchByByteStringSet
     , fetchPeek, fetchRPeek
       -- * other types
     , Flag(..), Attribute(..), MailboxStatus(..)
@@ -469,6 +469,19 @@ fetchByByteStringR :: IMAPConnection -> (UID, UID) -> String
                    -> IO [(UID, [(String, ByteString)])]
 fetchByByteStringR conn (s, e) command =
     fetchCommandBS conn ("UID FETCH "++show s++":"++show e++" "++command) proc
+    where proc (n, ps) =
+              (maybe (toEnum (fromIntegral n)) (read . BS.unpack) (lookup' "UID" ps), ps)
+
+-- | Fetch arbitrary data items for an exact set of UIDs.
+--
+-- Unlike 'fetchByByteStringR', this does not fetch messages whose UIDs happen
+-- to lie between sparse search results.
+fetchByByteStringSet :: IMAPConnection -> [UID] -> String
+                     -> IO [(UID, [(String, ByteString)])]
+fetchByByteStringSet _ [] _ = return []
+fetchByByteStringSet conn uids command =
+    fetchCommandBS conn
+        ("UID FETCH "++intercalate "," (map show uids)++" "++command) proc
     where proc (n, ps) =
               (maybe (toEnum (fromIntegral n)) (read . BS.unpack) (lookup' "UID" ps), ps)
 

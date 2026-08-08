@@ -457,6 +457,26 @@ imapFetchTest =
               ]
           fetched <- IMAP.fetchR conn (1, 2)
           [(101, firstBody), (102, secondBody)] @=? fetched
+    , "fetchByByteStringSet fetches an exact sparse UID set" ~: TestCase $ do
+          let firstStructure = BS.pack "(\"TEXT\" \"PLAIN\")"
+              secondStructure = BS.pack "(\"APPLICATION\" \"PDF\")"
+          (conn, written) <- scriptedConnection
+              [ line "* 1 FETCH (BODYSTRUCTURE (\"TEXT\" \"PLAIN\") UID 101)"
+              , line "* 2 FETCH (BODYSTRUCTURE (\"APPLICATION\" \"PDF\") UID 999)"
+              , okLine "FETCH completed"
+              ]
+          fetched <- IMAP.fetchByByteStringSet conn [101, 205, 999] "BODYSTRUCTURE"
+          [ (101, [("BODYSTRUCTURE", firstStructure), ("UID", BS.pack "101")])
+            , (999, [("BODYSTRUCTURE", secondStructure), ("UID", BS.pack "999")])
+            ] @=? fetched
+          actual <- written
+          commandBytes "000000 UID FETCH 101,205,999 BODYSTRUCTURE" @=? actual
+    , "fetchByByteStringSet skips the command for an empty UID set" ~: TestCase $ do
+          (conn, written) <- scriptedConnection []
+          fetched <- IMAP.fetchByByteStringSet conn [] "BODYSTRUCTURE"
+          [] @=? fetched
+          actual <- written
+          B.empty @=? actual
     , "fetchByString keeps scalar and literal values compatible" ~: TestCase $ do
           let headers = BS.pack "hello"
           (conn, _) <- scriptedConnection
