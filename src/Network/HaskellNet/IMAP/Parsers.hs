@@ -127,7 +127,7 @@ Parser pSelect =
                        emptyBox { _isWritable = isJust writable && fromJust writable == READ_WRITE }
                    _ -> emptyBox
        return (resp, MboxUpdate Nothing Nothing, foldl (flip ($)) box untagged)
-    where emptyBox = MboxInfo "" 0 0 [] [] False False 0 0
+    where emptyBox = emptyMboxInfo
 
 pFetch :: RespDerivs -> Result RespDerivs (ServerResponse, MboxUpdate, [(Integer, [(String, String)])])
 Parser pFetch =
@@ -314,7 +314,10 @@ pSelectLine =
        choice [ pExistsLine >>= \n -> return (\mbox -> mbox { _exists = n })
               , pRecentLine >>= \n -> return (\mbox -> mbox { _recent = n })
               , pFlags  >>= \fs -> return (\mbox -> mbox { _flags = fs })
-              , string "OK " >> okResps ]
+              , string "OK " >> okResps
+              , do { string "NO [UIDNOTSTICKY]"
+                   ; anyChar `manyTill` crlfP
+                   ; return (\mbox -> mbox { _uidNotSticky = True }) } ]
     where pFlags = do string "FLAGS "
                       char '('
                       fs <- pFlag `sepBy` space

@@ -44,6 +44,7 @@ data MailboxInfo = MboxInfo { _mailbox :: MailboxName
                             , _isFlagWritable :: Bool
                             , _uidNext :: UID
                             , _uidValidity :: UID
+                            , _uidNotSticky :: Bool
                             }
                  deriving (Show, Eq)
 
@@ -143,4 +144,4 @@ instance Derivs RespDerivs where
     dvPos  = advPos
 
 emptyMboxInfo :: MailboxInfo
-emptyMboxInfo = MboxInfo "" 0 0 [] [] False False 0 0
+emptyMboxInfo = MboxInfo "" 0 0 [] [] False False 0 0 False

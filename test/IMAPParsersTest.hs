@@ -116,7 +116,7 @@ selectTest =
     [ ( OK (Just READ_WRITE) "SELECT completed"
       , MboxUpdate Nothing Nothing
       , MboxInfo "" 172 1 [Answered, Flagged, Deleted, Seen, Draft]
-                     [Deleted, Seen] True True 4392 3857529045 )
+                     [Deleted, Seen] True True 4392 3857529045 False )
       ~=? eval' pSelect "A142"
               "* 172 EXISTS\r\n\
               \* 1 RECENT\r\n\
@@ -129,7 +129,7 @@ selectTest =
     , (OK (Just READ_ONLY) "EXAMINE completed"
       , MboxUpdate Nothing Nothing
       , MboxInfo "" 17 2 [Answered, Flagged, Deleted, Seen, Draft]
-                     [] False False 4392 3857529045 )
+                     [] False False 4392 3857529045 False )
       ~=? eval' pSelect "A932"
               "* 17 EXISTS\r\n\
               \* 2 RECENT\r\n\
@@ -139,6 +139,12 @@ selectTest =
               \* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
               \* OK [PERMANENTFLAGS ()] No permanent flags permitted\r\n\
               \A932 OK [READ-ONLY] EXAMINE completed\r\n"
+    , (OK (Just READ_WRITE) "SELECT completed"
+      , MboxUpdate Nothing Nothing
+      , MboxInfo "" 0 0 [] [] True False 0 0 True )
+      ~=? eval' pSelect "A143"
+              "* NO [UIDNOTSTICKY] UIDs are not persistent\r\n\
+              \A143 OK [READ-WRITE] SELECT completed\r\n"
     ]
 
 listTest =
@@ -450,7 +456,17 @@ imapFetchTest =
     ]
 
 imapUIDPlusTest =
-    [ "appendFullUID returns appenduid response code" ~: TestCase $ do
+    [ "select retains uidnotsticky response code" ~: TestCase $ do
+          (conn, written) <- scriptedConnection
+              [ line "* NO [UIDNOTSTICKY] UIDs are not persistent"
+              , okLine "[READ-WRITE] SELECT completed"
+              ]
+          IMAP.select conn "INBOX"
+          notSticky <- uidNotSticky conn
+          True @=? notSticky
+          actual <- written
+          commandBytes "000000 SELECT \"INBOX\"" @=? actual
+    , "appendFullUID returns appenduid response code" ~: TestCase $ do
           let mailData = BS.pack "Subject: x\r\n\r\nBody\r\n"
               expectedCommand = "000000 APPEND \"foo bar\" {" ++ show (BS.length mailData) ++ "}"
           (conn, written) <- scriptedConnection
